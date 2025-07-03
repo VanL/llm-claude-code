@@ -1,26 +1,27 @@
 [project]
-name = "llm-anthropic"
-version = "0.17"
-description = "LLM access to models by Anthropic, including the Claude series"
+name = "llm-claude-code"
+version = "0.1.0"
+description = "LLM plugin for Claude models via the claude-code-sdk"
 readme = "README.md"
-authors = [{name = "Simon Willison"}]
+authors = [{name = "Van Lindberg"}]
 license = {text = "Apache-2.0"}
 classifiers = [
     "License :: OSI Approved :: Apache Software License"
 ]
 dependencies = [
     "llm>=0.26",
-    "anthropic>=0.48.0",
+    "claude-code-sdk>=0.1.0",
+    "pydantic>=2.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/simonw/llm-anthropic"
-Changelog = "https://github.com/simonw/llm-anthropic/releases"
-Issues = "https://github.com/simonw/llm-anthropic/issues"
-CI = "https://github.com/simonw/llm-anthropic/actions"
+Homepage = "https://github.com/VanL/llm-claude-code"
+Changelog = "https://github.com/VanL/llm-claude-code/releases"
+Issues = "https://github.com/VanL/llm-claude-code/issues"
+CI = "https://github.com/VanL/llm-claude-code/actions"
 
 [project.entry-points.llm]
-anthropic = "llm_anthropic"
+claude_code = "llm_claude_code"
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-recording", "pytest-asyncio", "cogapp"]

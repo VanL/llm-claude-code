@@ -1,34 +1,34 @@
-# llm-anthropic
+# llm-claude-code
 
-[![PyPI](https://img.shields.io/pypi/v/llm-anthropic.svg)](https://pypi.org/project/llm-anthropic/)
-[![Changelog](https://img.shields.io/github/v/release/simonw/llm-anthropic?include_prereleases&label=changelog)](https://github.com/simonw/llm-anthropic/releases)
-[![Tests](https://github.com/simonw/llm-anthropic/actions/workflows/test.yml/badge.svg)](https://github.com/simonw/llm-anthropic/actions/workflows/test.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/simonw/llm-anthropic/blob/main/LICENSE)
+[![Changelog](https://img.shields.io/github/v/release/VanL/llm-claude-code?include_prereleases&label=changelog)](https://github.com/VanL/llm-claude-code/releases)
+[![Tests](https://github.com/VanL/llm-claude-code/actions/workflows/test.yml/badge.svg)](https://github.com/VanL/llm-claude-code/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/VanL/llm-claude-code/blob/main/LICENSE)
 
-LLM access to models by Anthropic, including the Claude series
+LLM plugin for accessing Claude models through the [claude-code-sdk](https://github.com/anthropics/claude-code-sdk-python)
+
+## Overview
+
+This plugin provides access to Claude models via the Claude Code SDK instead of the standard Anthropic API. It routes all requests through the SDK, which enables:
+
+- Integration with Claude Code's development-focused features
+- Access to Claude 4 Opus and Sonnet models
+- Support for system prompts and conversation history
+- Tool/function calling through the SDK's allowed_tools mechanism
 
 ## Installation
 
-Install this plugin in the same environment as [LLM](https://llm.datasette.io/).
+Install this plugin in the same environment as [LLM](https://llm.datasette.io/) from source:
 ```bash
-llm install llm-anthropic
+git clone https://github.com/VanL/llm-claude-code
+cd llm-claude-code
+pip install -e .
 ```
 
-<details><summary>Instructions for users who need to upgrade from <code>llm-claude-3</code></summary>
+## Prerequisites
 
-<br>
-
-If you previously used `llm-claude-3` you can upgrade like this:
-
-```bash
-llm install -U llm-claude-3
-llm keys set anthropic --value "$(llm keys get claude)"
-```
-The first line will remove the previous `llm-claude-3` version and install this one, because the latest `llm-claude-3` depends on `llm-anthropic`.
-
-The second line sets the `anthropic` key to whatever value you previously used for the `claude` key.
-
-</details>
+- Python 3.10+
+- Node.js (required by claude-code-sdk)
+- Claude Code CLI installed globally
 
 ## Usage
 
@@ -42,209 +42,110 @@ You can also set the key in the environment variable `ANTHROPIC_API_KEY`
 
 Run `llm models` to list the models, and `llm models --options` to include a list of their options.
 
+### Available Models
+
+This plugin provides access to the following models through the Claude Code SDK:
+
+- `claude-code-opus` (or `claude-code-opus-4-20250514`) - Claude 4 Opus
+- `claude-code-sonnet` (or `claude-code-sonnet-4-20250514`) - Claude 4 Sonnet
+
 Run prompts like this:
 ```bash
-llm -m claude-4-opus 'Fun facts about walruses'
-llm -m claude-4-sonnet 'Fun facts about pelicans'
-llm -m claude-3.5-haiku 'Fun facts about armadillos'
+llm -m claude-code-opus 'Fun facts about walruses'
+llm -m claude-code-sonnet 'Fun facts about pelicans'
 ```
-Image attachments are supported too:
+
+### Working with Code
+
+Since this uses the Claude Code SDK, it's particularly well-suited for coding tasks:
 ```bash
-llm -m claude-3.5-sonnet 'describe this image' -a https://static.simonwillison.net/static/2024/pelicans.jpg
-llm -m claude-3-haiku 'extract text' -a page.png
+llm -m claude-code-sonnet 'Write a Python function to calculate fibonacci numbers'
 ```
-The Claude 3.5 and 3.7 and 4 models can handle PDF files:
+
+### System Prompts
+
+You can set system prompts to guide the model's behavior:
 ```bash
-llm -m claude-3.5-sonnet 'extract text' -a page.pdf
+llm -m claude-code-opus 'Review this code' --system 'You are an expert code reviewer'
 ```
-Anthropic's models support [schemas](https://llm.datasette.io/en/stable/schemas.html). Here's how to use Claude 3.7 Sonnet to invent a dog:
 
+### Conversations
+
+The plugin supports multi-turn conversations:
 ```bash
-llm -m claude-3.7-sonnet --schema 'name,age int,bio: one sentence' 'invent a surprising dog'
-```
-Example output:
-```json
-{
-  "name": "Whiskers the Mathematical Mastiff",
-  "age": 7,
-  "bio": "Whiskers is a mastiff who can solve complex calculus problems by barking in binary code and has won three international mathematics competitions against human competitors."
-}
+llm -m claude-code-sonnet --continue
+# This starts an interactive conversation
 ```
 
-## Extended reasoning with Claude 3.7 Sonnet
+## Model Options
 
-Claude 3.7 introduced [extended thinking](https://www.anthropic.com/news/visible-extended-thinking) mode, where Claude can expend extra effort thinking through the prompt before producing a response.
+The following options can be passed using `-o name value` on the CLI:
 
-Use the `-o thinking 1` option to enable this feature:
+- **max_tokens**: `int` - Maximum number of tokens to generate
+- **temperature**: `float` - Sampling temperature (0.0-1.0)
+- **top_p**: `float` - Top-p sampling parameter
+- **top_k**: `int` - Top-k sampling parameter
+- **stop_sequences**: `str` or `list` - Sequences that stop generation
+- **system_prompt**: `str` - System prompt to use
+- **cwd**: `str` - Working directory for Claude Code
 
-```bash
-llm -m claude-3.7-sonnet -o thinking 1 'Write a convincing speech to congress about the need to protect the California Brown Pelican'
-```
-The chain of thought is not currently visible while using LLM, but it is logged to the database and can be viewed using this command:
-```bash
-llm logs -c --json
-```
-Or in combination with `jq`:
-```bash
-llm logs --json -c | jq '.[0].response_json.content[0].thinking' -r
-```
-By default up to 1024 tokens can be used for thinking. You can increase this budget with the `thinking_budget` option:
-```bash
-llm -m claude-3.7-sonnet -o thinking_budget 32000 'Write a long speech about pelicans in French'
-```
+Note: Some features from the standard Anthropic API (like prefill, cache, user_id) are tracked but may not be fully functional through the SDK.
 
-## Model options
+## Differences from llm-anthropic
 
-The following options can be passed using `-o name value` on the CLI or as `keyword=value` arguments to the Python `model.prompt()` method:
+This plugin differs from the standard `llm-anthropic` plugin in several ways:
 
-<!-- [[[cog
-import cog, llm
-_type_lookup = {
-    "number": "float",
-    "integer": "int",
-    "string": "str",
-    "object": "dict",
-}
-
-model = llm.get_model("claude-3.7-sonnet")
-output = []
-for name, field in model.Options.schema()["properties"].items():
-    any_of = field.get("anyOf")
-    if any_of is None:
-        any_of = [{"type": field["type"]}]
-    types = ", ".join(
-        [
-            _type_lookup.get(item["type"], item["type"])
-            for item in any_of
-            if item["type"] != "null"
-        ]
-    )
-    bits = ["- **", name, "**: `", types, "`\n"]
-    description = field.get("description", "")
-    if description:
-        bits.append('\n    ' + description + '\n\n')
-    output.append("".join(bits))
-cog.out("".join(output))
-]]] -->
-- **max_tokens**: `int`
-
-    The maximum number of tokens to generate before stopping
-
-- **temperature**: `float`
-
-    Amount of randomness injected into the response. Defaults to 1.0. Ranges from 0.0 to 1.0. Use temperature closer to 0.0 for analytical / multiple choice, and closer to 1.0 for creative and generative tasks. Note that even with temperature of 0.0, the results will not be fully deterministic.
-
-- **top_p**: `float`
-
-    Use nucleus sampling. In nucleus sampling, we compute the cumulative distribution over all the options for each subsequent token in decreasing probability order and cut it off once it reaches a particular probability specified by top_p. You should either alter temperature or top_p, but not both. Recommended for advanced use cases only. You usually only need to use temperature.
-
-- **top_k**: `int`
-
-    Only sample from the top K options for each subsequent token. Used to remove 'long tail' low probability responses. Recommended for advanced use cases only. You usually only need to use temperature.
-
-- **user_id**: `str`
-
-    An external identifier for the user who is associated with the request
-
-- **prefill**: `str`
-
-    A prefill to use for the response
-
-- **hide_prefill**: `boolean`
-
-    Do not repeat the prefill value at the start of the response
-
-- **stop_sequences**: `array, str`
-
-    Custom text sequences that will cause the model to stop generating - pass either a list of strings or a single string
-
-- **cache**: `boolean`
-
-    Use Anthropic prompt cache for any attachments or fragments
-
-- **thinking**: `boolean`
-
-    Enable thinking mode
-
-- **thinking_budget**: `int`
-
-    Number of tokens to budget for thinking
-
-<!-- [[[end]]] -->
-
-The `prefill` option can be used to set the first part of the response. To increase the chance of returning JSON, set that to `{`:
-
-```bash
-llm -m claude-3.5-sonnet 'Fun data about pelicans' \
-  -o prefill '{'
-```
-If you do not want the prefill token to be echoed in the response, set `hide_prefill` to `true`:
-
-```bash
-llm -m claude-3.5-haiku 'Short python function describing a pelican' \
-  -o prefill '```python' \
-  -o hide_prefill true \
-  -o stop_sequences '```'
-```
-This example sets `` ``` `` as the stop sequence, so the response will be a Python function without the wrapping Markdown code block.
-
-To pass a single stop sequence, send a string:
-```bash
-llm -m claude-3.5-sonnet 'Fun facts about pelicans' \
-  -o stop-sequences "beak"
-```
-For multiple stop sequences, pass a JSON array:
-
-```bash
-llm -m claude-3.5-sonnet 'Fun facts about pelicans' \
-  -o stop-sequences '["beak", "feathers"]'
-```
-
-When using the Python API, pass a string or an array of strings:
-
-```python
-response = llm.query(
-    model="claude-3.5-sonnet",
-    query="Fun facts about pelicans",
-    stop_sequences=["beak", "feathers"],
-)
-```
+1. **Model Access**: Only Opus and Sonnet models are available through the SDK
+2. **Model Names**: All models are prefixed with `claude-code-` to avoid conflicts
+3. **SDK Routing**: All requests go through the claude-code-sdk instead of direct API calls
+4. **Feature Support**: Some features like image attachments, PDFs, and structured output may work differently or have limited support
+5. **Tool Calling**: Uses the SDK's `allowed_tools` mechanism instead of standard function calling
 
 ## Development
 
 To set up this plugin locally, first checkout the code. Then create a new virtual environment:
 ```bash
-cd llm-anthropic
+cd llm-claude-code
 python3 -m venv venv
 source venv/bin/activate
 ```
 Now install the dependencies and test dependencies:
 ```bash
-llm install -e '.[test]'
+pip install -e '.[test]'
 ```
 To run the tests:
 ```bash
 pytest
 ```
 
-This project uses [pytest-recording](https://github.com/kiwicom/pytest-recording) to record Anthropic API responses for the tests.
+This project uses [pytest-recording](https://github.com/kiwicom/pytest-recording) to record Claude Code SDK responses for the tests.
 
 If you add a new test that calls the API you can capture the API response like this:
 ```bash
 PYTEST_ANTHROPIC_API_KEY="$(llm keys get anthropic)" pytest --record-mode once
 ```
-You will need to have stored a valid Anthropic API key using this command first:
+
+## Troubleshooting
+
+### "No claude-code-sdk found" error
+Make sure you have installed the claude-code-sdk:
+```bash
+pip install claude-code-sdk
+```
+
+### "No Anthropic API key found" error
+Set your API key using:
 ```bash
 llm keys set anthropic
-# Paste key here
 ```
-I use the following sequence:
+Or set the `ANTHROPIC_API_KEY` environment variable.
+
+### Node.js errors
+The claude-code-sdk requires Node.js. Make sure you have it installed:
 ```bash
-# First delete the relevant cassette if it exists already:
-rm tests/cassettes/test_anthropic/test_thinking_prompt.yaml
-# Run this failing test to recreate the cassette
-PYTEST_ANTHROPIC_API_KEY="$(llm keys get claude)" pytest -k test_thinking_prompt --record-mode once
-# Now run the test again with --pdb to figure out how to update it
-pytest -k test_thinking_prompt --pdb
-# Edit test
+node --version
 ```
+
+## License
+
+Apache License 2.0
