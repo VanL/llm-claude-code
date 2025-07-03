@@ -1,6 +1,6 @@
 [project]
 name = "llm-claude-code"
-version = "0.1.1"
+version = "0.1.2"
 description = "LLM plugin for Claude models via the claude-code-sdk"
 readme = "README.md"
 authors = [{name = "Van Lindberg"}]

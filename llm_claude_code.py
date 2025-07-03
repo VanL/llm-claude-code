@@ -289,6 +289,15 @@ class _Shared:
             "max_turns": 1,  # LLM interface expects single turn responses
         }
         
+        # Add model parameter - convert full model name to "sonnet" or "opus"
+        if "sonnet" in self.claude_model_id.lower():
+            sdk_options["model"] = "sonnet"
+        elif "opus" in self.claude_model_id.lower():
+            sdk_options["model"] = "opus"
+        # If neither sonnet nor opus is in the model name, default to opus
+        else:
+            sdk_options["model"] = "opus"
+        
         # Add working directory if specified
         if hasattr(options, "cwd") and options.cwd:
             sdk_options["cwd"] = options.cwd
