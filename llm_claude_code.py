@@ -8,8 +8,6 @@ import os
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Set, Union
 
 import llm
-from llm.models import model_from_llm_id
-from llm.types import Options
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
@@ -259,25 +257,30 @@ class _Shared:
     
     def prefill_text(self, prompt):
         """Get prefill text if specified and not hidden"""
-        if hasattr(prompt.options, "prefill") and prompt.options.prefill:
-            if not (hasattr(prompt.options, "hide_prefill") and prompt.options.hide_prefill):
-                return prompt.options.prefill
+        options = getattr(prompt, 'options', None)
+        if options and hasattr(options, "prefill") and options.prefill:
+            if not (hasattr(options, "hide_prefill") and options.hide_prefill):
+                return options.prefill
         return ""
 
     def build_options(self, prompt: llm.Prompt, stream: bool) -> SDKClaudeCodeOptions:
         """Build SDK options from prompt options"""
-        options = prompt.options or self.Options()
+        options = getattr(prompt, 'options', None)
+        if options is None:
+            # Create default options
+            options = ClaudeCodeOptions()
         
         # Extract system prompt from conversation if present
         system_prompt = None
-        if prompt.conversation:
-            for response in prompt.conversation.responses:
+        conversation = getattr(prompt, 'conversation', None)
+        if conversation:
+            for response in conversation.responses:
                 if response.prompt.system:
                     system_prompt = response.prompt.system
                     break
         
         # Override with explicit system option if provided
-        if prompt.system:
+        if hasattr(prompt, 'system') and prompt.system:
             system_prompt = prompt.system
 
         # Build the SDK options with only supported fields
@@ -291,7 +294,9 @@ class _Shared:
             sdk_options["cwd"] = options.cwd
 
         # Handle tool/function calling through allowed_tools
-        if prompt.tools or (prompt.conversation and hasattr(prompt.conversation, "tools") and prompt.conversation.tools):
+        tools = getattr(prompt, 'tools', None)
+        conv_tools = conversation and hasattr(conversation, "tools") and conversation.tools
+        if tools or conv_tools:
             # Map LLM tools to Claude Code allowed tools
             # This is a simplified mapping - you may need to adjust based on tool names
             sdk_options["allowed_tools"] = ["Bash", "Read", "Write", "Edit"]
@@ -314,8 +319,9 @@ class _Shared:
         parts = []
         
         # Add conversation history if present
-        if prompt.conversation:
-            for response in prompt.conversation.responses:
+        conversation = getattr(prompt, 'conversation', None)
+        if conversation:
+            for response in conversation.responses:
                 # Add user message
                 if response.prompt.prompt:
                     parts.append(f"Human: {response.prompt.prompt}")
@@ -331,12 +337,14 @@ class _Shared:
         
         # Add current prompt with prefill support
         current_parts = []
-        if prompt.prompt:
-            current_parts.append(prompt.prompt)
+        prompt_text = getattr(prompt, 'prompt', None)
+        if prompt_text:
+            current_parts.append(prompt_text)
         
         # Handle attachments (SDK doesn't directly support these, so we describe them)
-        if prompt.attachments:
-            for attachment in prompt.attachments:
+        attachments = getattr(prompt, 'attachments', None)
+        if attachments:
+            for attachment in attachments:
                 attachment_type = attachment.resolve_type()
                 
                 if attachment_type in self.attachment_types:
@@ -437,19 +445,21 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
         os.environ["ANTHROPIC_API_KEY"] = api_key
 
         # Build options
-        options = self.build_options(prompt, stream)
+        sdk_options = self.build_options(prompt, stream)
         
         # Build prompt with conversation history
         full_prompt = self.build_prompt_with_conversation(prompt)
         
         # Check for schema + tools conflict
-        if prompt.schema and prompt.tools:
+        schema = getattr(prompt, 'schema', None)
+        tools = getattr(prompt, 'tools', None)
+        if schema and tools:
             raise ValueError("Cannot use both schema and tools in the same prompt")
         
         # Handle structured output if schema is provided
-        if prompt.schema:
+        if schema:
             # Append schema instruction to prompt
-            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(prompt.schema)}\n"
+            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(schema)}\n"
             full_prompt += schema_instruction
 
         # Run the async query in a sync context
@@ -462,14 +472,15 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
             # Add prefill to accumulated text if needed
             prefill = self.prefill_text(prompt)
             if prefill:
-                if not prompt.options.hide_prefill:
+                prompt_options = getattr(prompt, 'options', None)
+                if not (prompt_options and hasattr(prompt_options, 'hide_prefill') and prompt_options.hide_prefill):
                     accumulated_text.append(prefill)
                     if stream:
                         yield prefill
                 else:
                     prefill_stripped = True
             
-            async for message in query(prompt=full_prompt, options=options):
+            async for message in query(prompt=full_prompt, options=sdk_options):
                 text, metadata = self.process_response_content(message, prompt._response if hasattr(prompt, "_response") else None)
                 
                 # Skip empty text from prefill stripping
@@ -510,7 +521,8 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
             if not stream and accumulated_text:
                 # Strip prefill if hidden
                 final_text = "".join(accumulated_text)
-                if prompt.options.hide_prefill and prefill:
+                options = getattr(prompt, 'options', None)
+                if options and hasattr(options, 'hide_prefill') and options.hide_prefill and prefill:
                     final_text = final_text[len(prefill):]
                 yield final_text
             
@@ -528,24 +540,40 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
                 # Store response JSON
                 prompt._response.response_json = full_response_json
 
-        # Create event loop if needed and run the async generator
+        # Run the async generator synchronously
+        loop = None
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        # Convert async generator to sync
-        async_gen = _async_stream()
-        while True:
+            # Try to get existing loop
             try:
-                chunk = loop.run_until_complete(async_gen.__anext__())
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No loop running, create a new one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+            # Collect all output first to avoid async issues
+            async def run_async():
+                results = []
+                async for chunk in _async_stream():
+                    results.append(chunk)
+                return results
+            
+            # Run and get all results
+            results = loop.run_until_complete(run_async())
+            
+            # Yield all results
+            for chunk in results:
                 yield chunk
-            except StopAsyncIteration:
-                break
+        finally:
+            # Don't close the loop if we didn't create it
+            pass
 
     def stream_method(self) -> str:
         return "stream"
+    
+    def execute(self, prompt: llm.Prompt, stream: bool, **kwargs) -> Iterator[str]:
+        """Execute method required by LLM framework"""
+        return self.stream(prompt, stream, **kwargs)
 
 
 class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
@@ -579,19 +607,21 @@ class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
         os.environ["ANTHROPIC_API_KEY"] = api_key
 
         # Build options
-        options = self.build_options(prompt, stream)
+        sdk_options = self.build_options(prompt, stream)
         
         # Build prompt with conversation history
         full_prompt = self.build_prompt_with_conversation(prompt)
         
         # Check for schema + tools conflict
-        if prompt.schema and prompt.tools:
+        schema = getattr(prompt, 'schema', None)
+        tools = getattr(prompt, 'tools', None)
+        if schema and tools:
             raise ValueError("Cannot use both schema and tools in the same prompt")
         
         # Handle structured output if schema is provided
-        if prompt.schema:
+        if schema:
             # Append schema instruction to prompt
-            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(prompt.schema)}\n"
+            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(schema)}\n"
             full_prompt += schema_instruction
 
         accumulated_text = []
@@ -609,7 +639,7 @@ class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
             else:
                 prefill_stripped = True
         
-        async for message in query(prompt=full_prompt, options=options):
+        async for message in query(prompt=full_prompt, options=sdk_options):
             text, metadata = self.process_response_content(message, prompt._response if hasattr(prompt, "_response") else None)
             
             # Skip empty text from prefill stripping
@@ -650,7 +680,8 @@ class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
         if not stream and accumulated_text:
             # Strip prefill if hidden
             final_text = "".join(accumulated_text)
-            if prompt.options.hide_prefill and prefill:
+            options = getattr(prompt, 'options', None)
+            if options and hasattr(options, 'hide_prefill') and options.hide_prefill and prefill:
                 final_text = final_text[len(prefill):]
             yield final_text
         
@@ -670,6 +701,11 @@ class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
 
     def stream_method(self) -> str:
         return "stream"
+    
+    async def execute(self, prompt: llm.Prompt, stream: bool, **kwargs) -> AsyncIterator[str]:
+        """Execute method required by LLM framework"""
+        async for chunk in self.stream(prompt, stream, **kwargs):
+            yield chunk
 
 
 @llm.hookimpl
