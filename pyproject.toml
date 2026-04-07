@@ -1,7 +1,7 @@
 [project]
 name = "llm-claude-code"
 version = "0.1.2"
-description = "LLM plugin for Claude models via the claude-code-sdk"
+description = "LLM plugin for Claude models via the Claude Agent SDK"
 readme = "README.md"
 authors = [{name = "Van Lindberg"}]
 license = {text = "Apache-2.0"}
@@ -10,9 +10,8 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "llm>=0.26",
-    "claude-code-sdk>=0.0.14",
-    "pydantic>=2.0",
+    "llm>=0.28",
+    "claude-agent-sdk>=0.1.44",
 ]
 
 [project.urls]
@@ -25,7 +24,7 @@ CI = "https://github.com/VanL/llm-claude-code/actions"
 claude_code = "llm_claude_code"
 
 [project.optional-dependencies]
-test = ["pytest", "pytest-recording", "pytest-asyncio", "cogapp"]
+test = ["pytest", "pytest-asyncio"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"

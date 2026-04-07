@@ -1,733 +1,1087 @@
 """
-LLM plugin for Claude Code SDK - provides access to Claude models through the claude-code-sdk
+LLM plugin for Claude Code / Claude Agent SDK.
 """
+
 import asyncio
-import base64
 import json
 import os
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Set, Union
+import queue
+import threading
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
 
 import llm
-from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
-    from claude_code_sdk import (
-        query,
-        ClaudeCodeOptions as SDKClaudeCodeOptions,
+    from claude_agent_sdk import (
         AssistantMessage,
-        TextBlock,
-        ToolUseBlock,
-        ToolResultBlock,
-        UserMessage,
-        SystemMessage,
+        ClaudeAgentOptions as SDKClaudeOptions,
         ResultMessage,
+        SystemMessage,
+        TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+        query,
     )
+    from claude_agent_sdk.types import StreamEvent
+
+    SDK_NAME = "claude-agent-sdk"
 except ImportError:
-    raise ImportError(
-        "You need to install the claude-code-sdk package: pip install claude-code-sdk"
-    )
+    try:
+        from claude_code_sdk import (  # type: ignore[no-redef]
+            AssistantMessage,
+            ClaudeCodeOptions as SDKClaudeOptions,
+            ResultMessage,
+            SystemMessage,
+            TextBlock,
+            ThinkingBlock,
+            ToolResultBlock,
+            ToolUseBlock,
+            UserMessage,
+            query,
+        )
+        from claude_code_sdk.types import StreamEvent  # type: ignore[no-redef]
 
-DEFAULT_THINKING_TOKENS = 1024
+        SDK_NAME = "claude-code-sdk"
+    except ImportError as ex:
+        raise ImportError(
+            "Install either claude-agent-sdk (recommended) or claude-code-sdk"
+        ) from ex
+
+
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_THINKING_TOKENS = 1024
 
 
-# Model configurations with their capabilities
-# Only models available through Claude Code SDK
 MODEL_CONFIGS = {
-    # Current Claude 4 models (available through SDK)
     "claude-code-opus-4-20250514": {
         "claude_model_id": "claude-opus-4-20250514",
+        "sdk_model": "claude-opus-4-20250514",
         "supports_images": True,
         "supports_pdf": True,
         "supports_thinking": True,
+        "supports_web_search": True,
         "default_max_tokens": 8192,
-        "aliases": ["claude-code-opus", "claude-code-opus-4"],
+        "aliases": [
+            "claude-code-opus-4",
+        ],
+    },
+    "claude-code-opus-4-1-20250805": {
+        "claude_model_id": "claude-opus-4-1-20250805",
+        "sdk_model": "claude-opus-4-1-20250805",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "supports_web_search": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-opus-4.1",
+        ],
+    },
+    "claude-code-opus-4-5-20251101": {
+        "claude_model_id": "claude-opus-4-5-20251101",
+        "sdk_model": "claude-opus-4-5-20251101",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "supports_thinking_effort": True,
+        "supports_web_search": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-opus-4.5",
+        ],
+    },
+    "claude-code-opus-4-6": {
+        "claude_model_id": "claude-opus-4-6",
+        "sdk_model": "claude-opus-4-6",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "supports_thinking_effort": True,
+        "supports_adaptive_thinking": True,
+        "supports_max_thinking_effort": True,
+        "supports_assistant_prefill": False,
+        "supports_web_search": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-opus",
+            "claude-code-opus-4.6",
+            "claude-code-opus-latest",
+        ],
     },
     "claude-code-sonnet-4-20250514": {
         "claude_model_id": "claude-sonnet-4-20250514",
+        "sdk_model": "claude-sonnet-4-20250514",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "supports_web_search": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-sonnet-4",
+        ],
+    },
+    "claude-code-sonnet-4-5": {
+        "claude_model_id": "claude-sonnet-4-5",
+        "sdk_model": "claude-sonnet-4-5",
         "supports_images": True,
         "supports_pdf": True,
         "supports_thinking": True,
         "default_max_tokens": 8192,
-        "aliases": ["claude-code-sonnet", "claude-code-sonnet-4"],
+        "aliases": [
+            "claude-code-sonnet-4.5",
+        ],
+    },
+    "claude-code-sonnet-4-6": {
+        "claude_model_id": "claude-sonnet-4-6",
+        "sdk_model": "claude-sonnet-4-6",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "supports_thinking_effort": True,
+        "supports_adaptive_thinking": True,
+        "supports_assistant_prefill": False,
+        "supports_web_search": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-sonnet",
+            "claude-code-sonnet-4.6",
+            "claude-code-sonnet-latest",
+        ],
+    },
+    "claude-code-haiku-4-5-20251001": {
+        "claude_model_id": "claude-haiku-4-5-20251001",
+        "sdk_model": "claude-haiku-4-5-20251001",
+        "supports_images": True,
+        "supports_pdf": True,
+        "supports_thinking": True,
+        "default_max_tokens": 8192,
+        "aliases": [
+            "claude-code-haiku",
+            "claude-code-haiku-4.5",
+            "claude-code-haiku-latest",
+        ],
     },
 }
 
+
 def source_for_attachment(attachment):
-    """Convert attachment to format suitable for Claude Code SDK"""
     if attachment.url:
         return {
             "type": "url",
             "url": attachment.url,
         }
-    else:
-        return {
-            "data": attachment.base64_content(),
-            "media_type": attachment.resolve_type(),
-            "type": "base64",
-        }
+    return {
+        "data": attachment.base64_content(),
+        "media_type": attachment.resolve_type(),
+        "type": "base64",
+    }
 
 
-class ClaudeCodeOptions(BaseModel):
-    """Options for Claude Code models"""
-
-    # Claude Code SDK supported options
-    system_prompt: Optional[str] = Field(
-        default=None,
-        description="System prompt to use",
-    )
-    max_turns: Optional[int] = Field(
-        default=1,
-        description="Maximum number of conversation turns",
-    )
-    allowed_tools: Optional[List[str]] = Field(
-        default=None,
-        description="List of allowed tools for Claude Code to use",
-    )
-    permission_mode: Optional[str] = Field(
-        default=None,
-        description="Permission mode for tool usage ('ask', 'acceptEdits', 'acceptAll')",
-    )
-    cwd: Optional[str] = Field(
-        default=None,
-        description="Working directory for Claude Code",
-    )
-    
-    # Standard Anthropic API options (not directly supported by SDK, but we'll track them)
-    max_tokens: Optional[int] = Field(
-        default=None,
-        description="Maximum number of tokens to generate",
-    )
-    temperature: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Sampling temperature",
-    )
-    top_p: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="Top-p sampling parameter",
-    )
-    top_k: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Top-k sampling parameter",
-    )
-    stop_sequences: Optional[Union[str, List[str]]] = Field(
-        default=None,
-        description="Sequences that stop generation",
-    )
-    user_id: Optional[str] = Field(
-        default=None,
-        description="A UUID representing your end-user (for Anthropic's safety monitoring)",
-    )
-    prefill: Optional[str] = Field(
-        default=None,
-        description="Start of Claude's response to prefill",
-    )
-    hide_prefill: Optional[bool] = Field(
-        default=False,
-        description="Hide prefill from output",
-    )
-    cache: Optional[bool] = Field(
-        default=None,
-        description="Enable prompt caching",
-    )
-
-    @field_validator("temperature")
-    @classmethod
-    def validate_temperature(cls, temperature):
-        if temperature == 0:
-            return 0
-        return temperature or DEFAULT_TEMPERATURE
-
-    @field_validator("top_p")
-    @classmethod
-    def validate_top_p(cls, top_p):
-        if top_p is not None and not (0.0 <= top_p <= 1.0):
-            raise ValueError("top_p must be in range 0.0-1.0")
-        return top_p
-
-    @field_validator("top_k")
-    @classmethod
-    def validate_top_k(cls, top_k):
-        if top_k is not None and top_k <= 0:
-            raise ValueError("top_k must be a positive integer")
-        return top_k
-
-    @model_validator(mode="after")
-    def validate_temperature_top_p(self):
-        if self.temperature != 1.0 and self.top_p is not None:
-            raise ValueError("Only one of temperature and top_p can be set")
-        return self
-
-    @field_validator("stop_sequences")
-    @classmethod
-    def validate_stop_sequences(cls, stop_sequences):
-        if stop_sequences is None:
+def _parse_optional_list(value: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
             return None
-        if isinstance(stop_sequences, str):
-            # Try to parse as JSON first
-            try:
-                parsed = json.loads(stop_sequences)
-                if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                pass
-            # Otherwise treat as single stop sequence
-            return [stop_sequences]
-        elif isinstance(stop_sequences, list):
-            if all(isinstance(s, str) for s in stop_sequences):
-                return stop_sequences
-            else:
-                raise ValueError("stop_sequences must be a list of strings")
-        else:
-            raise ValueError(
-                "stop_sequences must be a string, a JSON array of strings, or a list"
-            )
-        return stop_sequences
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return None
 
 
-class ClaudeCodeOptionsWithThinking(ClaudeCodeOptions):
-    """Options for Claude Code models with thinking support"""
+def _parse_optional_object(value: Optional[Union[str, Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as ex:
+            raise ValueError("Expected a JSON object") from ex
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Expected a JSON object")
 
-    thinking: Optional[bool] = Field(
-        default=None,
-        description="Enable thinking mode",
-    )
-    thinking_budget: Optional[int] = Field(
-        default=1024,
-        description="Token budget for thinking",
-    )
+
+def _parse_stop_sequences(value: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    parsed = _parse_optional_list(value)
+    if parsed:
+        return parsed
+    return None
+
+
+def _schema_to_dict(schema: Any) -> Optional[Dict[str, Any]]:
+    if schema is None:
+        return None
+    if isinstance(schema, dict):
+        return schema
+    if hasattr(schema, "model_json_schema"):
+        return schema.model_json_schema()
+    raise ValueError("Schema must be a JSON schema dict or a Pydantic model class")
+
+
+def _normalize_permission_mode(raw_mode: Optional[str]) -> Optional[str]:
+    if raw_mode is None:
+        return None
+
+    mode = raw_mode.strip()
+    if not mode:
+        return None
+
+    if SDK_NAME == "claude-agent-sdk":
+        mapping = {
+            "ask": "default",
+            "acceptAll": "bypassPermissions",
+        }
+    else:
+        mapping = {
+            "default": "ask",
+            "bypassPermissions": "acceptAll",
+        }
+    return mapping.get(mode, mode)
+
+
+class ClaudeCodeOptions(llm.Options):
+    # SDK-native options
+    system_prompt: Optional[str] = None
+    append_system_prompt: Optional[str] = None
+    max_turns: Optional[int] = None
+    tools: Optional[Union[str, List[str]]] = None
+    allowed_tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
+    permission_mode: Optional[str] = None
+    permission_prompt_tool_name: Optional[str] = None
+    cwd: Optional[str] = None
+    add_dirs: Optional[Union[str, List[str]]] = None
+    continue_conversation: Optional[bool] = None
+    resume: Optional[str] = None
+    include_partial_messages: bool = False
+    setting_sources: Optional[Union[str, List[str]]] = None
+    max_budget_usd: Optional[float] = None
+    fallback_model: Optional[str] = None
+    betas: Optional[Union[str, List[str]]] = None
+    settings: Optional[str] = None
+    output_format: Optional[Union[str, Dict[str, Any]]] = None
+
+    # Claude thinking controls
+    thinking: Optional[bool] = None
+    thinking_budget: Optional[int] = None
+    max_thinking_tokens: Optional[int] = None
+    effort: Optional[str] = None
+    thinking_effort: Optional[str] = None
+
+    # llm-anthropic compatibility options
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    stop_sequences: Optional[Union[str, List[str]]] = None
+    user_id: Optional[str] = None
+    prefill: Optional[str] = None
+    hide_prefill: bool = False
+    cache: Optional[bool] = None
+    web_search: bool = False
+    web_search_max_uses: Optional[int] = None
+    web_search_allowed_domains: Optional[Union[str, List[str]]] = None
+    web_search_blocked_domains: Optional[Union[str, List[str]]] = None
+    web_search_location: Optional[Union[str, Dict[str, Any]]] = None
 
 
 class _Shared:
-    """Shared functionality between sync and async implementations"""
-
     needs_key = "anthropic"
     key_env_var = "ANTHROPIC_API_KEY"
     can_stream = True
-    
-    # Default capabilities
-    supports_schema = True  # SDK may not directly support, but we can work with structured prompts
-    supports_tools = True   # SDK supports tools through allowed_tools
+    supports_schema = True
+    supports_tools = True
+    Options = ClaudeCodeOptions
 
     def __init__(self, model_id: str, config: dict):
-        self.model_id = "anthropic/" + model_id  # Prefix for compatibility
-        # Use the claude_model_id from config if provided, otherwise extract from model_id
-        self.claude_model_id = config.get("claude_model_id", model_id.replace("claude-code-", "claude-"))
-        self.supports_images = config["supports_images"]
-        self.supports_pdf = config["supports_pdf"]
+        self.model_id = "anthropic/" + model_id
+        self.claude_model_id = config.get(
+            "claude_model_id",
+            model_id.replace("claude-code-", "claude-"),
+        )
+        self.sdk_model = config.get("sdk_model")
+        self.supports_images = config.get("supports_images", False)
+        self.supports_pdf = config.get("supports_pdf", False)
         self.supports_thinking = config.get("supports_thinking", False)
+        self.supports_thinking_effort = config.get("supports_thinking_effort", False)
+        self.supports_adaptive_thinking = config.get(
+            "supports_adaptive_thinking",
+            False,
+        )
+        self.supports_max_thinking_effort = config.get(
+            "supports_max_thinking_effort",
+            False,
+        )
+        self.supports_assistant_prefill = config.get(
+            "supports_assistant_prefill",
+            True,
+        )
+        self.supports_web_search = config.get("supports_web_search", False)
         self.default_max_tokens = config.get("default_max_tokens", 4096)
         self._api_key = None
-        
-        # Build attachment types set
+
         self.attachment_types = set()
         if self.supports_images:
-            self.attachment_types.update({
-                "image/png",
-                "image/jpeg",
-                "image/webp",
-                "image/gif",
-            })
+            self.attachment_types.update(
+                {
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                    "image/gif",
+                }
+            )
         if self.supports_pdf:
             self.attachment_types.add("application/pdf")
-            
-        # Set options class based on capabilities
-        if self.supports_thinking:
-            self.Options = ClaudeCodeOptionsWithThinking
-        else:
-            self.Options = ClaudeCodeOptions
 
     def get_key(self, key=None):
-        """Get API key from parameter, env var, or key store"""
         if key:
             return key
-
-        # Check environment variable
         from_env = os.environ.get(self.key_env_var)
         if from_env:
             return from_env
-
-        # Check key store - llm framework passes this to us
+        model_key = getattr(self, "key", None)
+        if model_key:
+            return model_key
         return self._api_key
-    
-    def prefill_text(self, prompt):
-        """Get prefill text if specified and not hidden"""
-        options = getattr(prompt, 'options', None)
-        if options and hasattr(options, "prefill") and options.prefill:
-            if not (hasattr(options, "hide_prefill") and options.hide_prefill):
-                return options.prefill
+
+    def prompt_blocks(self):
+        remove_role = getattr(llm, "remove_role_block", None)
+        if remove_role is not None:
+            yield remove_role()
+        multi_binary_attachments = getattr(llm, "multi_binary_attachments_block", None)
+        if multi_binary_attachments is not None:
+            yield multi_binary_attachments()
+
+    def _prompt_options(self, prompt: llm.Prompt) -> ClaudeCodeOptions:
+        options = getattr(prompt, "options", None)
+        if options is None:
+            return ClaudeCodeOptions()
+        return options
+
+    def _prefill_text(self, prompt: llm.Prompt) -> str:
+        options = self._prompt_options(prompt)
+        if options.prefill and not options.hide_prefill:
+            return options.prefill
         return ""
 
-    def build_options(self, prompt: llm.Prompt, stream: bool) -> SDKClaudeCodeOptions:
-        """Build SDK options from prompt options"""
-        options = getattr(prompt, 'options', None)
-        if options is None:
-            # Create default options
-            options = ClaudeCodeOptions()
-        
-        # Extract system prompt from conversation if present
-        system_prompt = None
-        conversation = getattr(prompt, 'conversation', None)
+    def _response_text(self, response_obj: Any) -> str:
+        try:
+            if hasattr(response_obj, "text_or_raise"):
+                return response_obj.text_or_raise()
+        except Exception:
+            return ""
+        try:
+            if hasattr(response_obj, "text"):
+                return response_obj.text()
+        except Exception:
+            return ""
+        return ""
+
+    def _response_tool_calls(self, response_obj: Any) -> List[Any]:
+        try:
+            if hasattr(response_obj, "tool_calls_or_raise"):
+                return response_obj.tool_calls_or_raise()
+        except Exception:
+            return []
+        return []
+
+    def _build_messages(self, prompt: llm.Prompt, conversation=None) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+
         if conversation:
-            for response in conversation.responses:
-                if response.prompt.system:
-                    system_prompt = response.prompt.system
-                    break
-        
-        # Override with explicit system option if provided
-        if hasattr(prompt, 'system') and prompt.system:
-            system_prompt = prompt.system
+            for previous_response in conversation.responses:
+                user_content: List[Dict[str, Any]] = []
 
-        # Build the SDK options with only supported fields
-        sdk_options = {
-            "system_prompt": system_prompt,
-            "max_turns": 1,  # LLM interface expects single turn responses
-        }
-        
-        # Add model parameter - convert full model name to "sonnet" or "opus"
-        if "sonnet" in self.claude_model_id.lower():
-            sdk_options["model"] = "sonnet"
-        elif "opus" in self.claude_model_id.lower():
-            sdk_options["model"] = "opus"
-        # If neither sonnet nor opus is in the model name, default to opus
-        else:
-            sdk_options["model"] = "opus"
-        
-        # Add working directory if specified
-        if hasattr(options, "cwd") and options.cwd:
-            sdk_options["cwd"] = options.cwd
+                response_attachments = getattr(previous_response, "attachments", None)
+                if response_attachments:
+                    for attachment in response_attachments:
+                        attachment_type = (
+                            "document"
+                            if attachment.resolve_type() == "application/pdf"
+                            else "image"
+                        )
+                        user_content.append(
+                            {
+                                "type": attachment_type,
+                                "source": source_for_attachment(attachment),
+                            }
+                        )
 
-        # Handle tool/function calling through allowed_tools
-        tools = getattr(prompt, 'tools', None)
-        conv_tools = conversation and hasattr(conversation, "tools") and conversation.tools
-        if tools or conv_tools:
-            # Map LLM tools to Claude Code allowed tools
-            # This is a simplified mapping - you may need to adjust based on tool names
-            sdk_options["allowed_tools"] = ["Bash", "Read", "Write", "Edit"]
-            sdk_options["permission_mode"] = "ask"
-        elif hasattr(options, "allowed_tools") and options.allowed_tools:
-            sdk_options["allowed_tools"] = options.allowed_tools
-            if hasattr(options, "permission_mode") and options.permission_mode:
-                sdk_options["permission_mode"] = options.permission_mode
+                previous_prompt_text = getattr(previous_response.prompt, "prompt", None)
+                if previous_prompt_text:
+                    user_content.append(
+                        {
+                            "type": "text",
+                            "text": previous_prompt_text,
+                        }
+                    )
 
-        return SDKClaudeCodeOptions(**sdk_options)
+                response_tool_results = getattr(previous_response.prompt, "tool_results", None)
+                if response_tool_results:
+                    for tool_result in response_tool_results:
+                        user_content.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_result.tool_call_id,
+                                "content": tool_result.output,
+                            }
+                        )
 
-    def build_messages(self, prompt: llm.Prompt, conversation=None) -> List[dict]:
-        """Build messages array for conversation history - not used by SDK but kept for compatibility"""
-        messages = []
-        # The Claude Code SDK handles conversation differently, so we'll just track this for logging
+                if user_content:
+                    messages.append({"role": "user", "content": user_content})
+
+                assistant_content: List[Dict[str, Any]] = []
+                text_content = self._response_text(previous_response)
+                if text_content:
+                    assistant_content.append({"type": "text", "text": text_content})
+
+                for tool_call in self._response_tool_calls(previous_response):
+                    assistant_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": tool_call.tool_call_id,
+                            "name": tool_call.name,
+                            "input": tool_call.arguments,
+                        }
+                    )
+
+                if assistant_content:
+                    messages.append({"role": "assistant", "content": assistant_content})
+
+        user_content: List[Dict[str, Any]] = []
+
+        if prompt.attachments:
+            for attachment in prompt.attachments:
+                attachment_type = (
+                    "document"
+                    if attachment.resolve_type() == "application/pdf"
+                    else "image"
+                )
+                user_content.append(
+                    {
+                        "type": attachment_type,
+                        "source": source_for_attachment(attachment),
+                    }
+                )
+
+            options = self._prompt_options(prompt)
+            if options.cache and user_content:
+                user_content[-1]["cache_control"] = {"type": "ephemeral"}
+
+        if prompt.tool_results:
+            for tool_result in prompt.tool_results:
+                user_content.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_result.tool_call_id,
+                        "content": tool_result.output,
+                    }
+                )
+
+        if prompt.prompt:
+            user_content.append({"type": "text", "text": prompt.prompt})
+
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
+
+        options = self._prompt_options(prompt)
+        if options.prefill:
+            if not self.supports_assistant_prefill:
+                raise ValueError(
+                    f"Prefilling assistant messages is not supported by {self.claude_model_id}. "
+                    "Use structured outputs or system prompt instructions instead."
+                )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": options.prefill}],
+                }
+            )
+
         return messages
-    
-    def build_prompt_with_conversation(self, prompt: llm.Prompt) -> str:
-        """Build a complete prompt including conversation history and attachments"""
-        parts = []
-        
-        # Add conversation history if present
-        conversation = getattr(prompt, 'conversation', None)
-        if conversation:
-            for response in conversation.responses:
-                # Add user message
-                if response.prompt.prompt:
-                    parts.append(f"Human: {response.prompt.prompt}")
-                
-                # Add assistant response
-                if response.text():
-                    parts.append(f"Assistant: {response.text()}")
-                    
-                # Add tool results if any
-                if hasattr(response.prompt, "tool_results") and response.prompt.tool_results:
-                    for tool_result in response.prompt.tool_results:
-                        parts.append(f"Tool Result ({tool_result.tool_call_id}): {tool_result.output}")
-        
-        # Add current prompt with prefill support
-        current_parts = []
-        prompt_text = getattr(prompt, 'prompt', None)
-        if prompt_text:
-            current_parts.append(prompt_text)
-        
-        # Handle attachments (SDK doesn't directly support these, so we describe them)
-        attachments = getattr(prompt, 'attachments', None)
-        if attachments:
-            for attachment in attachments:
-                attachment_type = attachment.resolve_type()
-                
-                if attachment_type in self.attachment_types:
-                    if attachment_type.startswith("image/") and self.supports_images:
-                        # For images, we'll need to handle them differently with Claude Code
-                        current_parts.append(f"[Image: {attachment.path or 'embedded image'}]")
-                    elif attachment_type == "application/pdf" and self.supports_pdf:
-                        current_parts.append(f"[PDF Document: {attachment.path or 'embedded PDF'}]")
-                elif attachment_type == "text/plain" or attachment_type is None:
-                    # For text files, we can include the content directly
-                    try:
-                        content = attachment.read_text()
-                        current_parts.append(f"[File content from {attachment.path or 'attachment'}]:\n{content}")
-                    except:
-                        current_parts.append(f"[Text file: {attachment.path or 'attachment'}]")
-        
-        # Add prefill if specified
-        prefill = self.prefill_text(prompt)
-        if prefill:
-            current_parts.append(f"\nAssistant: {prefill}")
-        
-        if current_parts:
-            parts.append("Human: " + "\n".join(current_parts))
-        
+
+    def _content_block_to_text(self, block: Dict[str, Any]) -> str:
+        block_type = block.get("type")
+        if block_type == "text":
+            return block.get("text", "")
+        if block_type == "tool_result":
+            return "Tool result ({tool_use_id}): {content}".format(
+                tool_use_id=block.get("tool_use_id", "unknown"),
+                content=block.get("content", ""),
+            )
+        if block_type == "tool_use":
+            return "Tool call {name}: {arguments}".format(
+                name=block.get("name", "unknown"),
+                arguments=json.dumps(block.get("input", {})),
+            )
+        if block_type in ("image", "document"):
+            source = block.get("source", {})
+            if isinstance(source, dict):
+                if source.get("type") == "url":
+                    location = source.get("url", "attachment")
+                else:
+                    location = source.get("media_type", "binary data")
+            else:
+                location = "attachment"
+            label = "Image" if block_type == "image" else "Document"
+            return f"[{label} attachment: {location}]"
+        return str(block)
+
+    def _messages_to_fallback_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        schema_instruction: Optional[str],
+    ) -> str:
+        parts: List[str] = []
+
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            role_label = "Human" if role == "user" else "Assistant"
+
+            if isinstance(content, str):
+                parts.append(f"{role_label}: {content}")
+                continue
+
+            lines = [self._content_block_to_text(block) for block in content]
+            lines = [line for line in lines if line]
+            if lines:
+                parts.append(f"{role_label}: " + "\n".join(lines))
+
+        if schema_instruction:
+            parts.append(schema_instruction)
+
         return "\n\n".join(parts)
 
-    def process_response_content(self, message, response=None) -> tuple[str, dict]:
-        """Process a message from Claude Code SDK and extract text content and metadata"""
-        text_parts = []
-        metadata = {"message_type": type(message).__name__}
-        
+    def _build_query_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        schema_instruction: Optional[str],
+    ) -> tuple[Union[str, AsyncIterator[Dict[str, Any]]], str]:
+        has_assistant_history = any(message.get("role") != "user" for message in messages)
+
+        if has_assistant_history:
+            return (
+                self._messages_to_fallback_prompt(messages, schema_instruction),
+                "fallback_text",
+            )
+
+        async def _input_stream() -> AsyncIterator[Dict[str, Any]]:
+            for message in messages:
+                yield {
+                    "type": "user",
+                    "session_id": "",
+                    "message": message,
+                    "parent_tool_use_id": None,
+                }
+
+        return _input_stream(), "stream_json"
+
+    def _build_options(
+        self,
+        prompt: llm.Prompt,
+    ) -> tuple[SDKClaudeOptions, List[str], Optional[str]]:
+        options = self._prompt_options(prompt)
+        sdk_fields = set(getattr(SDKClaudeOptions, "__dataclass_fields__", {}).keys())
+        sdk_options: Dict[str, Any] = {}
+        ignored_options: List[str] = []
+        thinking_effort = options.effort or options.thinking_effort
+        thinking_requested = bool(options.thinking) or options.thinking_budget is not None
+
+        if options.top_p is not None and options.temperature not in (None, DEFAULT_TEMPERATURE):
+            raise ValueError("Only one of temperature and top_p can be set")
+
+        if options.effort and options.thinking_effort and options.effort != options.thinking_effort:
+            raise ValueError("Use either effort or thinking_effort, not both")
+
+        if options.thinking_effort and not self.supports_thinking_effort:
+            raise ValueError(
+                f"thinking_effort is not supported by {self.claude_model_id}"
+            )
+
+        if thinking_effort and not options.thinking and not self.supports_adaptive_thinking:
+            thinking_requested = True
+
+        if thinking_effort == "max" and not self.supports_max_thinking_effort:
+            raise ValueError(
+                "thinking_effort='max' is only supported by claude-opus-4-6"
+            )
+
+        if "system_prompt" in sdk_fields and prompt.system:
+            sdk_options["system_prompt"] = prompt.system
+        elif "system_prompt" in sdk_fields and options.system_prompt:
+            sdk_options["system_prompt"] = options.system_prompt
+
+        if "append_system_prompt" in sdk_fields and options.append_system_prompt:
+            sdk_options["append_system_prompt"] = options.append_system_prompt
+
+        if "model" in sdk_fields:
+            sdk_options["model"] = self.sdk_model or self.claude_model_id
+
+        if "max_turns" in sdk_fields:
+            sdk_options["max_turns"] = options.max_turns if options.max_turns is not None else 1
+
+        parsed_tools = _parse_optional_list(options.tools)
+        if prompt.tools:
+            parsed_tools = parsed_tools or []
+            for tool in prompt.tools:
+                name = getattr(tool, "name", None)
+                if name:
+                    parsed_tools.append(name)
+
+        if "tools" in sdk_fields and parsed_tools:
+            sdk_options["tools"] = parsed_tools
+        elif parsed_tools:
+            ignored_options.append("tools")
+
+        if "allowed_tools" in sdk_fields and options.allowed_tools:
+            sdk_options["allowed_tools"] = list(options.allowed_tools)
+
+        if "disallowed_tools" in sdk_fields and options.disallowed_tools:
+            sdk_options["disallowed_tools"] = list(options.disallowed_tools)
+
+        permission_mode = _normalize_permission_mode(options.permission_mode)
+        if "permission_mode" in sdk_fields and permission_mode:
+            sdk_options["permission_mode"] = permission_mode
+
+        if "permission_prompt_tool_name" in sdk_fields and options.permission_prompt_tool_name:
+            sdk_options["permission_prompt_tool_name"] = options.permission_prompt_tool_name
+
+        if "cwd" in sdk_fields and options.cwd:
+            sdk_options["cwd"] = options.cwd
+
+        if (
+            "continue_conversation" in sdk_fields
+            and options.continue_conversation is not None
+        ):
+            sdk_options["continue_conversation"] = options.continue_conversation
+
+        if "resume" in sdk_fields and options.resume:
+            sdk_options["resume"] = options.resume
+
+        if "include_partial_messages" in sdk_fields and options.include_partial_messages:
+            sdk_options["include_partial_messages"] = True
+
+        if "max_budget_usd" in sdk_fields and options.max_budget_usd is not None:
+            sdk_options["max_budget_usd"] = options.max_budget_usd
+
+        if "fallback_model" in sdk_fields and options.fallback_model:
+            sdk_options["fallback_model"] = options.fallback_model
+
+        add_dirs = _parse_optional_list(options.add_dirs)
+        if "add_dirs" in sdk_fields and add_dirs:
+            sdk_options["add_dirs"] = add_dirs
+
+        setting_sources = _parse_optional_list(options.setting_sources)
+        if "setting_sources" in sdk_fields and setting_sources:
+            sdk_options["setting_sources"] = setting_sources
+
+        betas = _parse_optional_list(options.betas)
+        if "betas" in sdk_fields and betas:
+            sdk_options["betas"] = betas
+
+        if "settings" in sdk_fields and options.settings:
+            sdk_options["settings"] = options.settings
+
+        if "user" in sdk_fields and options.user_id:
+            sdk_options["user"] = options.user_id
+        elif options.user_id:
+            ignored_options.append("user_id")
+
+        if "effort" in sdk_fields and thinking_effort:
+            sdk_options["effort"] = thinking_effort
+        elif thinking_effort:
+            ignored_options.append("thinking_effort")
+
+        if "max_thinking_tokens" in sdk_fields and options.max_thinking_tokens is not None:
+            sdk_options["max_thinking_tokens"] = options.max_thinking_tokens
+        elif options.max_thinking_tokens is not None:
+            ignored_options.append("max_thinking_tokens")
+
+        if "thinking" in sdk_fields:
+            if options.thinking is False:
+                sdk_options["thinking"] = {"type": "disabled"}
+            elif thinking_requested:
+                budget = options.thinking_budget
+                if budget is None and options.max_thinking_tokens is not None:
+                    budget = options.max_thinking_tokens
+                if self.supports_adaptive_thinking and budget is None:
+                    sdk_options["thinking"] = {"type": "adaptive"}
+                else:
+                    sdk_options["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": budget or DEFAULT_THINKING_TOKENS,
+                    }
+        elif options.thinking is not None or options.thinking_budget is not None:
+            ignored_options.append("thinking")
+
+        schema_dict = _schema_to_dict(prompt.schema)
+        schema_instruction = None
+
+        output_format = _parse_optional_object(options.output_format)
+        if schema_dict and output_format is None:
+            output_format = {
+                "type": "json_schema",
+                "schema": schema_dict,
+            }
+
+        if output_format:
+            if "output_format" in sdk_fields:
+                sdk_options["output_format"] = output_format
+            else:
+                schema_instruction = (
+                    "Please respond with valid JSON matching this schema:\n"
+                    + json.dumps(output_format.get("schema", output_format))
+                )
+
+        if options.web_search:
+            if not self.supports_web_search:
+                raise ValueError(f"Web search is not supported by model {self.model_id}")
+            if options.web_search_max_uses is not None:
+                raise ValueError("web_search_max_uses is not supported by Claude SDK")
+            if _parse_optional_list(options.web_search_allowed_domains):
+                raise ValueError("web_search_allowed_domains is not supported by Claude SDK")
+            if _parse_optional_list(options.web_search_blocked_domains):
+                raise ValueError("web_search_blocked_domains is not supported by Claude SDK")
+            if _parse_optional_object(options.web_search_location):
+                raise ValueError("web_search_location is not supported by Claude SDK")
+
+            if "allowed_tools" in sdk_fields:
+                allowed = list(sdk_options.get("allowed_tools", []))
+                if "WebSearch" not in allowed:
+                    allowed.append("WebSearch")
+                sdk_options["allowed_tools"] = allowed
+            else:
+                ignored_options.append("web_search")
+
+        # Compatibility knobs currently not exposed by Claude SDK
+        if options.max_tokens is not None:
+            ignored_options.append("max_tokens")
+        if options.temperature not in (None, DEFAULT_TEMPERATURE):
+            ignored_options.append("temperature")
+        if options.top_p is not None:
+            ignored_options.append("top_p")
+        if options.top_k is not None:
+            ignored_options.append("top_k")
+        if _parse_stop_sequences(options.stop_sequences):
+            ignored_options.append("stop_sequences")
+        if options.cache:
+            ignored_options.append("cache")
+
+        return SDKClaudeOptions(**sdk_options), ignored_options, schema_instruction
+
+    def _extract_stream_event_text(self, message: StreamEvent, schema_expected: bool) -> str:
+        event = getattr(message, "event", None)
+        if not isinstance(event, dict):
+            return ""
+        if event.get("type") != "content_block_delta":
+            return ""
+        delta = event.get("delta", {})
+        if not isinstance(delta, dict):
+            return ""
+
+        delta_type = delta.get("type")
+        if delta_type == "text_delta":
+            return delta.get("text") or ""
+        if schema_expected and delta_type in ("input_json_delta", "json_delta"):
+            return delta.get("partial_json") or delta.get("text") or ""
+        return ""
+
+    def _set_usage_from_sdk(
+        self,
+        response,
+        usage: Optional[dict],
+        prompt_text: str,
+        output: str,
+    ):
+        if usage:
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
+
+            if not isinstance(input_tokens, int):
+                alt_input = usage.get("inputTokens")
+                input_tokens = alt_input if isinstance(alt_input, int) else None
+            if not isinstance(output_tokens, int):
+                alt_output = usage.get("outputTokens")
+                output_tokens = alt_output if isinstance(alt_output, int) else None
+
+            details = {
+                key: value
+                for key, value in usage.items()
+                if key not in ("input_tokens", "output_tokens", "inputTokens", "outputTokens")
+            }
+            response.set_usage(
+                input=input_tokens,
+                output=output_tokens,
+                details=details or None,
+            )
+            return
+
+        response.set_usage(
+            input=int(len(prompt_text.split()) * 1.3),
+            output=int(len(output.split()) * 1.3),
+        )
+
+    def _serialize_message(self, message: Any) -> Dict[str, Any]:
         if isinstance(message, AssistantMessage):
+            content = []
             for block in message.content:
                 if isinstance(block, TextBlock):
-                    text_parts.append(block.text)
+                    content.append({"type": "text", "text": block.text})
+                elif isinstance(block, ThinkingBlock):
+                    content.append({"type": "thinking", "thinking": block.thinking})
                 elif isinstance(block, ToolUseBlock):
-                    # Record tool usage and add to response if available
-                    tool_call_data = {
-                        "name": getattr(block, "name", "unknown"),
-                        "id": getattr(block, "id", None),
-                        "arguments": getattr(block, "input", {}),
-                    }
-                    
-                    if "tool_uses" not in metadata:
-                        metadata["tool_uses"] = []
-                    metadata["tool_uses"].append(tool_call_data)
-                    
-                    # Add tool call to response object if available
-                    if response and hasattr(response, "add_tool_call"):
+                    content.append(
+                        {
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        }
+                    )
+                elif isinstance(block, ToolResultBlock):
+                    content.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.tool_use_id,
+                            "content": block.content,
+                            "is_error": block.is_error,
+                        }
+                    )
+            return {
+                "type": "assistant",
+                "model": getattr(message, "model", None),
+                "content": content,
+            }
+
+        if isinstance(message, UserMessage):
+            return {
+                "type": "user",
+                "content": getattr(message, "content", None),
+            }
+
+        if isinstance(message, SystemMessage):
+            return {
+                "type": "system",
+                "subtype": getattr(message, "subtype", None),
+            }
+
+        if isinstance(message, ResultMessage):
+            return {
+                "type": "result",
+                "subtype": message.subtype,
+                "duration_ms": message.duration_ms,
+                "duration_api_ms": message.duration_api_ms,
+                "is_error": message.is_error,
+                "num_turns": message.num_turns,
+                "session_id": message.session_id,
+                "total_cost_usd": message.total_cost_usd,
+                "usage": message.usage,
+                "result": message.result,
+                "structured_output": getattr(message, "structured_output", None),
+            }
+
+        if isinstance(message, StreamEvent):
+            return {
+                "type": "stream_event",
+                "session_id": message.session_id,
+                "uuid": message.uuid,
+                "event": message.event,
+            }
+
+        return {"type": type(message).__name__}
+
+    async def _execute_async_impl(
+        self,
+        prompt: llm.Prompt,
+        stream: bool,
+        response,
+        conversation,
+        key: Optional[str],
+    ) -> AsyncIterator[str]:
+        if prompt.schema and prompt.tools:
+            raise ValueError("Cannot use both schema and tools in the same prompt")
+
+        api_key = self.get_key(key)
+        if not api_key:
+            raise ValueError(
+                "No Anthropic API key found. Set ANTHROPIC_API_KEY or run 'llm keys set anthropic'."
+            )
+        os.environ[self.key_env_var] = api_key
+
+        options = self._prompt_options(prompt)
+        messages = self._build_messages(prompt, conversation)
+        sdk_options, ignored_options, schema_instruction = self._build_options(prompt)
+        query_prompt, prompt_mode = self._build_query_prompt(messages, schema_instruction)
+
+        response._prompt_json = {
+            "mode": prompt_mode,
+            "messages": messages,
+        }
+
+        chunks: List[str] = []
+        response_messages: List[Dict[str, Any]] = []
+        usage_data: Optional[dict] = None
+        saw_text = False
+        result_structured_output: Any = None
+        prefill = self._prefill_text(prompt)
+
+        if prefill:
+            chunks.append(prefill)
+            if stream:
+                yield prefill
+
+        async for message in query(prompt=query_prompt, options=sdk_options):
+            response_messages.append(self._serialize_message(message))
+
+            if isinstance(message, AssistantMessage):
+                if getattr(message, "model", None):
+                    response.resolved_model = message.model
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        saw_text = True
+                        chunks.append(block.text)
+                        if stream:
+                            yield block.text
+                    elif isinstance(block, ToolUseBlock):
                         response.add_tool_call(
-                            id=tool_call_data["id"],
-                            name=tool_call_data["name"],
-                            arguments=tool_call_data["arguments"],
+                            llm.ToolCall(
+                                tool_call_id=block.id,
+                                name=block.name,
+                                arguments=block.input or {},
+                            )
                         )
-        elif isinstance(message, UserMessage):
-            # Handle user messages if they come through
-            if hasattr(message, "content") and isinstance(message.content, str):
-                text_parts.append(message.content)
-        elif isinstance(message, SystemMessage):
-            # System messages typically don't need to be shown
-            metadata["system_message"] = True
-        elif isinstance(message, ResultMessage):
-            # Tool results
-            if hasattr(message, "content"):
-                text_parts.append(str(message.content))
-        
-        return "\n".join(text_parts), metadata
+
+            elif isinstance(message, StreamEvent):
+                partial_text = self._extract_stream_event_text(
+                    message,
+                    schema_expected=bool(prompt.schema),
+                )
+                if partial_text and options.include_partial_messages:
+                    saw_text = True
+                    chunks.append(partial_text)
+                    if stream:
+                        yield partial_text
+
+            elif isinstance(message, ResultMessage):
+                usage_data = message.usage
+                result_structured_output = getattr(message, "structured_output", None)
+                if message.is_error:
+                    raise RuntimeError(message.result or "Claude SDK returned an error")
+
+                if result_structured_output is not None and prompt.schema and not saw_text:
+                    serialized = json.dumps(result_structured_output)
+                    saw_text = True
+                    chunks.append(serialized)
+                    if stream:
+                        yield serialized
+
+                if message.result and not saw_text:
+                    saw_text = True
+                    chunks.append(message.result)
+                    if stream:
+                        yield message.result
+
+        final_text = "".join(chunks)
+        if not stream and final_text:
+            yield final_text
+
+        self._set_usage_from_sdk(response, usage_data, str(response._prompt_json), final_text)
+        response.response_json = {
+            "model": self.claude_model_id,
+            "sdk": SDK_NAME,
+            "messages": response_messages,
+            "ignored_options": sorted(set(ignored_options)),
+            "prompt_mode": prompt_mode,
+            "structured_output": result_structured_output,
+        }
 
 
 class ClaudeCodeMessages(_Shared, llm.KeyModel):
-    """Synchronous Claude Code model implementation"""
+    def execute(
+        self,
+        prompt: llm.Prompt,
+        stream: bool,
+        response: llm.Response,
+        conversation: Optional[llm.Conversation] = None,
+        key: Optional[str] = None,
+    ) -> Iterator[str]:
+        events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
 
-    can_stream = True
+        def run_async():
+            async def _consume():
+                try:
+                    async for chunk in self._execute_async_impl(
+                        prompt,
+                        stream,
+                        response,
+                        conversation,
+                        key,
+                    ):
+                        events.put(("chunk", chunk))
+                except Exception as ex:
+                    events.put(("error", ex))
+                finally:
+                    events.put(("done", None))
 
-    def __init__(self, model_id: str, config: dict):
-        super().__init__(model_id, config)
+            asyncio.run(_consume())
 
-    def get_options_class(self) -> type:
-        """Return the appropriate options class based on model capabilities"""
-        if self.supports_thinking:
-            return ClaudeCodeOptionsWithThinking
-        return ClaudeCodeOptions
+        worker = threading.Thread(target=run_async, daemon=True)
+        worker.start()
 
-    def prompt_blocks(self):
-        yield llm.remove_role_block()
-        yield llm.multi_binary_attachments_block()
-
-    def stream(self, prompt: llm.Prompt, stream: bool, **kwargs) -> Iterator[str]:
-        """Stream responses from Claude Code SDK"""
-        api_key = self.get_key(kwargs.get("key"))
-        if not api_key:
-            raise ValueError(
-                "No Anthropic API key found. Set ANTHROPIC_API_KEY environment variable "
-                "or use 'llm keys set anthropic'"
-            )
-
-        # Set the API key for the SDK
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-
-        # Build options
-        sdk_options = self.build_options(prompt, stream)
-        
-        # Build prompt with conversation history
-        full_prompt = self.build_prompt_with_conversation(prompt)
-        
-        # Check for schema + tools conflict
-        schema = getattr(prompt, 'schema', None)
-        tools = getattr(prompt, 'tools', None)
-        if schema and tools:
-            raise ValueError("Cannot use both schema and tools in the same prompt")
-        
-        # Handle structured output if schema is provided
-        if schema:
-            # Append schema instruction to prompt
-            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(schema)}\n"
-            full_prompt += schema_instruction
-
-        # Run the async query in a sync context
-        async def _async_stream():
-            accumulated_text = []
-            full_response_json = {}
-            usage_data = {}
-            prefill_stripped = False
-            
-            # Add prefill to accumulated text if needed
-            prefill = self.prefill_text(prompt)
-            if prefill:
-                prompt_options = getattr(prompt, 'options', None)
-                if not (prompt_options and hasattr(prompt_options, 'hide_prefill') and prompt_options.hide_prefill):
-                    accumulated_text.append(prefill)
-                    if stream:
-                        yield prefill
-                else:
-                    prefill_stripped = True
-            
-            async for message in query(prompt=full_prompt, options=sdk_options):
-                text, metadata = self.process_response_content(message, prompt._response if hasattr(prompt, "_response") else None)
-                
-                # Skip empty text from prefill stripping
-                if prefill_stripped and not text:
-                    prefill_stripped = False
-                    continue
-                    
-                if text:
-                    accumulated_text.append(text)
-                    if stream:
-                        yield text
-                
-                # Build response JSON structure
-                if isinstance(message, AssistantMessage):
-                    # Try to extract model info and usage if available
-                    full_response_json["model"] = self.claude_model_id
-                    full_response_json["message_type"] = "claude_code_response"
-                    
-                    # Store content blocks
-                    if "content" not in full_response_json:
-                        full_response_json["content"] = []
-                    
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            full_response_json["content"].append({
-                                "type": "text",
-                                "text": block.text
-                            })
-                        elif isinstance(block, ToolUseBlock):
-                            full_response_json["content"].append({
-                                "type": "tool_use",
-                                "id": getattr(block, "id", None),
-                                "name": getattr(block, "name", "unknown"),
-                                "input": getattr(block, "input", {})
-                            })
-            
-            # If not streaming, yield all accumulated text at once
-            if not stream and accumulated_text:
-                # Strip prefill if hidden
-                final_text = "".join(accumulated_text)
-                options = getattr(prompt, 'options', None)
-                if options and hasattr(options, 'hide_prefill') and options.hide_prefill and prefill:
-                    final_text = final_text[len(prefill):]
-                yield final_text
-            
-            # Set usage data (estimate since SDK doesn't provide it)
-            if hasattr(prompt, "_response") and prompt._response:
-                # Estimate token counts (rough approximation)
-                input_tokens = len(full_prompt.split()) * 1.3  # Rough estimate
-                output_tokens = len("".join(accumulated_text).split()) * 1.3
-                
-                prompt._response.set_usage(
-                    input=int(input_tokens),
-                    output=int(output_tokens)
-                )
-                
-                # Store response JSON
-                prompt._response.response_json = full_response_json
-
-        # Run the async generator synchronously
-        loop = None
-        try:
-            # Try to get existing loop
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # No loop running, create a new one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-            # Collect all output first to avoid async issues
-            async def run_async():
-                results = []
-                async for chunk in _async_stream():
-                    results.append(chunk)
-                return results
-            
-            # Run and get all results
-            results = loop.run_until_complete(run_async())
-            
-            # Yield all results
-            for chunk in results:
-                yield chunk
-        finally:
-            # Don't close the loop if we didn't create it
-            pass
-
-    def stream_method(self) -> str:
-        return "stream"
-    
-    def execute(self, prompt: llm.Prompt, stream: bool, **kwargs) -> Iterator[str]:
-        """Execute method required by LLM framework"""
-        return self.stream(prompt, stream, **kwargs)
+        while True:
+            event_type, payload = events.get()
+            if event_type == "chunk":
+                yield payload
+            elif event_type == "error":
+                worker.join(timeout=0.1)
+                raise payload
+            else:
+                break
+        worker.join()
 
 
 class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
-    """Asynchronous Claude Code model implementation"""
-
-    def __init__(self, model_id: str, config: dict):
-        super().__init__(model_id, config)
-
-    def get_options_class(self) -> type:
-        """Return the appropriate options class based on model capabilities"""
-        if self.supports_thinking:
-            return ClaudeCodeOptionsWithThinking
-        return ClaudeCodeOptions
-
-    def prompt_blocks(self):
-        yield llm.remove_role_block()
-        yield llm.multi_binary_attachments_block()
-
-    async def stream(
-        self, prompt: llm.Prompt, stream: bool, **kwargs
+    async def execute(
+        self,
+        prompt: llm.Prompt,
+        stream: bool,
+        response: llm.AsyncResponse,
+        conversation: Optional[llm.AsyncConversation] = None,
+        key: Optional[str] = None,
     ) -> AsyncIterator[str]:
-        """Stream responses from Claude Code SDK asynchronously"""
-        api_key = self.get_key(kwargs.get("key"))
-        if not api_key:
-            raise ValueError(
-                "No Anthropic API key found. Set ANTHROPIC_API_KEY environment variable "
-                "or use 'llm keys set anthropic'"
-            )
-
-        # Set the API key for the SDK
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-
-        # Build options
-        sdk_options = self.build_options(prompt, stream)
-        
-        # Build prompt with conversation history
-        full_prompt = self.build_prompt_with_conversation(prompt)
-        
-        # Check for schema + tools conflict
-        schema = getattr(prompt, 'schema', None)
-        tools = getattr(prompt, 'tools', None)
-        if schema and tools:
-            raise ValueError("Cannot use both schema and tools in the same prompt")
-        
-        # Handle structured output if schema is provided
-        if schema:
-            # Append schema instruction to prompt
-            schema_instruction = f"\n\nPlease respond with valid JSON matching this schema:\n{json.dumps(schema)}\n"
-            full_prompt += schema_instruction
-
-        accumulated_text = []
-        full_response_json = {}
-        usage_data = {}
-        prefill_stripped = False
-        
-        # Add prefill to accumulated text if needed
-        prefill = self.prefill_text(prompt)
-        if prefill:
-            if not prompt.options.hide_prefill:
-                accumulated_text.append(prefill)
-                if stream:
-                    yield prefill
-            else:
-                prefill_stripped = True
-        
-        async for message in query(prompt=full_prompt, options=sdk_options):
-            text, metadata = self.process_response_content(message, prompt._response if hasattr(prompt, "_response") else None)
-            
-            # Skip empty text from prefill stripping
-            if prefill_stripped and not text:
-                prefill_stripped = False
-                continue
-                
-            if text:
-                accumulated_text.append(text)
-                if stream:
-                    yield text
-            
-            # Build response JSON structure
-            if isinstance(message, AssistantMessage):
-                # Try to extract model info and usage if available
-                full_response_json["model"] = self.claude_model_id
-                full_response_json["message_type"] = "claude_code_response"
-                
-                # Store content blocks
-                if "content" not in full_response_json:
-                    full_response_json["content"] = []
-                
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        full_response_json["content"].append({
-                            "type": "text",
-                            "text": block.text
-                        })
-                    elif isinstance(block, ToolUseBlock):
-                        full_response_json["content"].append({
-                            "type": "tool_use",
-                            "id": getattr(block, "id", None),
-                            "name": getattr(block, "name", "unknown"),
-                            "input": getattr(block, "input", {})
-                        })
-        
-        # If not streaming, yield all accumulated text at once
-        if not stream and accumulated_text:
-            # Strip prefill if hidden
-            final_text = "".join(accumulated_text)
-            options = getattr(prompt, 'options', None)
-            if options and hasattr(options, 'hide_prefill') and options.hide_prefill and prefill:
-                final_text = final_text[len(prefill):]
-            yield final_text
-        
-        # Set usage data (estimate since SDK doesn't provide it)
-        if hasattr(prompt, "_response") and prompt._response:
-            # Estimate token counts (rough approximation)
-            input_tokens = len(full_prompt.split()) * 1.3  # Rough estimate
-            output_tokens = len("".join(accumulated_text).split()) * 1.3
-            
-            prompt._response.set_usage(
-                input=int(input_tokens),
-                output=int(output_tokens)
-            )
-            
-            # Store response JSON
-            prompt._response.response_json = full_response_json
-
-    def stream_method(self) -> str:
-        return "stream"
-    
-    async def execute(self, prompt: llm.Prompt, stream: bool, **kwargs) -> AsyncIterator[str]:
-        """Execute method required by LLM framework"""
-        async for chunk in self.stream(prompt, stream, **kwargs):
+        async for chunk in self._execute_async_impl(
+            prompt,
+            stream,
+            response,
+            conversation,
+            key,
+        ):
             yield chunk
 
 
 @llm.hookimpl
 def register_models(register):
-    """Register all Claude Code models with the LLM plugin system"""
     for model_id, config in MODEL_CONFIGS.items():
-        # Extract aliases from config
         aliases = config.get("aliases", [])
-        
-        # Create a copy of config without aliases for passing to model
         model_config = {k: v for k, v in config.items() if k != "aliases"}
-        
-        # Register sync models
         register(
             ClaudeCodeMessages(model_id, model_config),
             AsyncClaudeCodeMessages(model_id, model_config),
