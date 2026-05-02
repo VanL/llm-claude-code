@@ -31,16 +31,16 @@ pip install -e .
 - Python 3.10+
 - Node.js (required by Claude Code / Agent SDK)
 - Claude Code CLI installed globally
+- An authenticated Claude Code CLI session (`claude login` or an existing Claude Code login)
 
 ## Usage
 
-First, set [an API key](https://console.anthropic.com/settings/keys) for Anthropic:
+First, make sure Claude Code is installed and logged in:
 ```bash
-llm keys set anthropic
-# Paste key here
+claude --version
+claude auth status
+claude auth login
 ```
-
-You can also set the key in the environment variable `ANTHROPIC_API_KEY`
 
 Run `llm models` to list the models, and `llm models --options` to include a list of their options.
 
@@ -148,12 +148,13 @@ Make sure you have installed the Claude Agent SDK:
 pip install claude-agent-sdk
 ```
 
-### "No Anthropic API key found" error
-Set your API key using:
+### Claude authentication errors
+This plugin uses the Claude Agent SDK, which shells out to the Claude Code CLI. It uses your Claude Code login rather than an `llm` API key. If authentication fails, verify the CLI works directly:
 ```bash
-llm keys set anthropic
+claude -p "Say ok"
 ```
-Or set the `ANTHROPIC_API_KEY` environment variable.
+
+If that fails, run `claude auth login` and retry the `llm` command.
 
 ### Node.js errors
 The Claude SDK requires Node.js. Make sure you have it installed:

@@ -4,7 +4,6 @@ LLM plugin for Claude Code / Claude Agent SDK.
 
 import asyncio
 import json
-import os
 import queue
 import threading
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
@@ -303,8 +302,6 @@ class ClaudeCodeOptions(llm.Options):
 
 
 class _Shared:
-    needs_key = "anthropic"
-    key_env_var = "ANTHROPIC_API_KEY"
     can_stream = True
     supports_schema = True
     supports_tools = True
@@ -335,7 +332,6 @@ class _Shared:
         )
         self.supports_web_search = config.get("supports_web_search", False)
         self.default_max_tokens = config.get("default_max_tokens", 4096)
-        self._api_key = None
 
         self.attachment_types = set()
         if self.supports_images:
@@ -349,17 +345,6 @@ class _Shared:
             )
         if self.supports_pdf:
             self.attachment_types.add("application/pdf")
-
-    def get_key(self, key=None):
-        if key:
-            return key
-        from_env = os.environ.get(self.key_env_var)
-        if from_env:
-            return from_env
-        model_key = getattr(self, "key", None)
-        if model_key:
-            return model_key
-        return self._api_key
 
     def prompt_blocks(self):
         remove_role = getattr(llm, "remove_role_block", None)
@@ -914,17 +899,9 @@ class _Shared:
         stream: bool,
         response,
         conversation,
-        key: Optional[str],
     ) -> AsyncIterator[str]:
         if prompt.schema and prompt.tools:
             raise ValueError("Cannot use both schema and tools in the same prompt")
-
-        api_key = self.get_key(key)
-        if not api_key:
-            raise ValueError(
-                "No Anthropic API key found. Set ANTHROPIC_API_KEY or run 'llm keys set anthropic'."
-            )
-        os.environ[self.key_env_var] = api_key
 
         options = self._prompt_options(prompt)
         messages = self._build_messages(prompt, conversation)
@@ -1014,14 +991,13 @@ class _Shared:
         }
 
 
-class ClaudeCodeMessages(_Shared, llm.KeyModel):
+class ClaudeCodeMessages(_Shared, llm.Model):
     def execute(
         self,
         prompt: llm.Prompt,
         stream: bool,
         response: llm.Response,
         conversation: Optional[llm.Conversation] = None,
-        key: Optional[str] = None,
     ) -> Iterator[str]:
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
 
@@ -1033,7 +1009,6 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
                         stream,
                         response,
                         conversation,
-                        key,
                     ):
                         events.put(("chunk", chunk))
                 except Exception as ex:
@@ -1058,21 +1033,19 @@ class ClaudeCodeMessages(_Shared, llm.KeyModel):
         worker.join()
 
 
-class AsyncClaudeCodeMessages(_Shared, llm.AsyncKeyModel):
+class AsyncClaudeCodeMessages(_Shared, llm.AsyncModel):
     async def execute(
         self,
         prompt: llm.Prompt,
         stream: bool,
         response: llm.AsyncResponse,
         conversation: Optional[llm.AsyncConversation] = None,
-        key: Optional[str] = None,
     ) -> AsyncIterator[str]:
         async for chunk in self._execute_async_impl(
             prompt,
             stream,
             response,
             conversation,
-            key,
         ):
             yield chunk
 

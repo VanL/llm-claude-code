@@ -30,9 +30,7 @@ class Dog(BaseModel):
 
 
 def make_model(model_id=MODEL_ID):
-    model = plugin.ClaudeCodeMessages(model_id, model_config_for(model_id))
-    model.key = "sk-test"
-    return model
+    return plugin.ClaudeCodeMessages(model_id, model_config_for(model_id))
 
 
 def make_result(
@@ -74,6 +72,22 @@ def test_sync_response_collects_usage(monkeypatch):
     assert response.output_tokens == 7
     assert response.resolved_model == "claude-sonnet-4"
     assert response.response_json["sdk"] in ("claude-agent-sdk", "claude-code-sdk")
+
+
+def test_does_not_require_llm_anthropic_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    async def fake_query(*, prompt, options):
+        yield make_result(result="ok")
+
+    monkeypatch.setattr(plugin, "query", fake_query)
+
+    model = make_model()
+    response = model.prompt("Say ok", stream=False)
+
+    assert response.text() == "ok"
+    assert isinstance(model, llm.Model)
+    assert not isinstance(model, llm.KeyModel)
 
 
 def test_result_fallback_if_no_assistant_text(monkeypatch):
