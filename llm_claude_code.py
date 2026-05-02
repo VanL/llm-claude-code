@@ -4,7 +4,9 @@ LLM plugin for Claude Code / Claude Agent SDK.
 
 import asyncio
 import json
+import os
 import queue
+import shutil
 import threading
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
 
@@ -51,6 +53,8 @@ except ImportError:
 
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_THINKING_TOKENS = 1024
+MAX_STDERR_CHARS = 12000
+DIRECT_CLI_TEXT_THRESHOLD = 32000
 
 
 MODEL_CONFIGS = {
@@ -387,6 +391,50 @@ class _Shared:
             return []
         return []
 
+    def _format_sdk_error(self, message: ResultMessage) -> str:
+        if message.result:
+            return message.result
+
+        errors = getattr(message, "errors", None)
+        if errors:
+            return "Claude SDK returned an error: " + "; ".join(
+                str(error) for error in errors
+            )
+
+        permission_denials = getattr(message, "permission_denials", None)
+        if permission_denials:
+            return "Claude SDK returned permission denials: " + json.dumps(
+                permission_denials
+            )
+
+        return "Claude SDK returned an error"
+
+    def _format_stderr(self, stderr_lines: List[str]) -> str:
+        stderr = "\n".join(line for line in stderr_lines if line)
+        if not stderr:
+            return ""
+        if len(stderr) > MAX_STDERR_CHARS:
+            stderr = "[stderr truncated]\n" + stderr[-MAX_STDERR_CHARS:]
+        return stderr
+
+    def _find_claude_cli(self) -> str:
+        if cli := shutil.which("claude"):
+            return cli
+
+        for path in [
+            "~/.local/bin/claude",
+            "~/.claude/local/claude",
+            "~/.npm-global/bin/claude",
+            "/usr/local/bin/claude",
+        ]:
+            expanded = os.path.expanduser(path)
+            if os.path.isfile(expanded):
+                return expanded
+
+        raise RuntimeError(
+            "Claude Code CLI not found. Install Claude Code or add it to PATH."
+        )
+
     def _build_messages(self, prompt: llm.Prompt, conversation=None) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
 
@@ -555,6 +603,43 @@ class _Shared:
 
         return "\n\n".join(parts)
 
+    def _messages_to_text_prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        schema_instruction: Optional[str],
+    ) -> Optional[str]:
+        parts: List[str] = []
+
+        for message in messages:
+            if message.get("role") != "user":
+                return None
+
+            content = message.get("content", "")
+            if isinstance(content, str):
+                if content:
+                    parts.append(content)
+                continue
+
+            if not isinstance(content, list):
+                return None
+
+            text_parts: List[str] = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    return None
+                text = block.get("text", "")
+                if text:
+                    text_parts.append(text)
+            if text_parts:
+                parts.append("\n\n".join(text_parts))
+
+        if schema_instruction:
+            parts.append(schema_instruction)
+
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
     def _build_query_prompt(
         self,
         messages: List[Dict[str, Any]],
@@ -567,6 +652,10 @@ class _Shared:
                 self._messages_to_fallback_prompt(messages, schema_instruction),
                 "fallback_text",
             )
+
+        text_prompt = self._messages_to_text_prompt(messages, schema_instruction)
+        if text_prompt is not None:
+            return text_prompt, "text"
 
         async def _input_stream() -> AsyncIterator[Dict[str, Any]]:
             for message in messages:
@@ -582,6 +671,7 @@ class _Shared:
     def _build_options(
         self,
         prompt: llm.Prompt,
+        stderr_lines: Optional[List[str]] = None,
     ) -> tuple[SDKClaudeOptions, List[str], Optional[str]]:
         options = self._prompt_options(prompt)
         sdk_fields = set(getattr(SDKClaudeOptions, "__dataclass_fields__", {}).keys())
@@ -619,6 +709,12 @@ class _Shared:
 
         if "model" in sdk_fields:
             sdk_options["model"] = self.sdk_model or self.claude_model_id
+
+        if "env" in sdk_fields:
+            sdk_options["env"] = {"ANTHROPIC_API_KEY": ""}
+
+        if "stderr" in sdk_fields and stderr_lines is not None:
+            sdk_options["stderr"] = stderr_lines.append
 
         if "max_turns" in sdk_fields:
             sdk_options["max_turns"] = options.max_turns if options.max_turns is not None else 1
@@ -877,10 +973,15 @@ class _Shared:
                 "is_error": message.is_error,
                 "num_turns": message.num_turns,
                 "session_id": message.session_id,
+                "stop_reason": getattr(message, "stop_reason", None),
                 "total_cost_usd": message.total_cost_usd,
                 "usage": message.usage,
                 "result": message.result,
                 "structured_output": getattr(message, "structured_output", None),
+                "model_usage": getattr(message, "model_usage", None),
+                "permission_denials": getattr(message, "permission_denials", None),
+                "errors": getattr(message, "errors", None),
+                "uuid": getattr(message, "uuid", None),
             }
 
         if isinstance(message, StreamEvent):
@@ -892,6 +993,179 @@ class _Shared:
             }
 
         return {"type": type(message).__name__}
+
+    def _should_use_direct_cli(self, prompt: llm.Prompt, query_prompt: Any) -> bool:
+        if not isinstance(query_prompt, str):
+            return False
+        if len(query_prompt) < DIRECT_CLI_TEXT_THRESHOLD:
+            return False
+        if prompt.schema or prompt.tools or prompt.tool_results or prompt.attachments:
+            return False
+
+        options = self._prompt_options(prompt)
+        if options.prefill or options.web_search:
+            return False
+        if options.allowed_tools or options.disallowed_tools or options.tools:
+            return False
+
+        return True
+
+    def _direct_cli_command(self, prompt: llm.Prompt) -> tuple[List[str], Optional[str]]:
+        options = self._prompt_options(prompt)
+        cmd = [
+            self._find_claude_cli(),
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            self.sdk_model or self.claude_model_id,
+        ]
+
+        system_prompt = prompt.system or options.system_prompt
+        if system_prompt:
+            cmd.extend(["--system-prompt", system_prompt])
+
+        if options.append_system_prompt:
+            cmd.extend(["--append-system-prompt", options.append_system_prompt])
+
+        permission_mode = _normalize_permission_mode(options.permission_mode)
+        if permission_mode:
+            cmd.extend(["--permission-mode", permission_mode])
+
+        if options.max_turns is not None:
+            cmd.extend(["--max-turns", str(options.max_turns)])
+
+        if options.max_budget_usd is not None:
+            cmd.extend(["--max-budget-usd", str(options.max_budget_usd)])
+
+        if options.add_dirs:
+            for directory in _parse_optional_list(options.add_dirs) or []:
+                cmd.extend(["--add-dir", directory])
+
+        if options.setting_sources:
+            setting_sources = _parse_optional_list(options.setting_sources)
+            if setting_sources:
+                cmd.append(f"--setting-sources={','.join(setting_sources)}")
+
+        if options.settings:
+            cmd.extend(["--settings", options.settings])
+
+        if options.thinking is False:
+            cmd.extend(["--thinking", "disabled"])
+        elif options.thinking:
+            if self.supports_adaptive_thinking:
+                cmd.extend(["--thinking", "adaptive"])
+            else:
+                cmd.extend(["--max-thinking-tokens", str(DEFAULT_THINKING_TOKENS)])
+
+        if options.max_thinking_tokens is not None:
+            cmd.extend(["--max-thinking-tokens", str(options.max_thinking_tokens)])
+        elif options.thinking_budget is not None:
+            cmd.extend(["--max-thinking-tokens", str(options.thinking_budget)])
+
+        thinking_effort = options.effort or options.thinking_effort
+        if thinking_effort:
+            cmd.extend(["--effort", thinking_effort])
+
+        return cmd, options.cwd
+
+    async def _execute_direct_cli_text(
+        self,
+        prompt: llm.Prompt,
+        prompt_text: str,
+        stream: bool,
+        response,
+        ignored_options: List[str],
+        prompt_mode: str,
+    ) -> AsyncIterator[str]:
+        cmd, cwd = self._direct_cli_command(prompt)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "ANTHROPIC_API_KEY"
+        }
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        stdout_bytes, stderr_bytes = await process.communicate(prompt_text.encode())
+        stderr = stderr_bytes.decode(errors="replace").strip()
+        if process.returncode:
+            message = f"Claude CLI exited {process.returncode}"
+            if stderr:
+                message += f"\nClaude stderr:\n{stderr}"
+            raise RuntimeError(message)
+
+        chunks: List[str] = []
+        response_messages: List[Dict[str, Any]] = []
+        usage_data: Optional[dict] = None
+        result_structured_output: Any = None
+        result_text: Optional[str] = None
+
+        for line in stdout_bytes.decode(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            response_messages.append(message)
+            message_type = message.get("type")
+
+            if message_type == "assistant":
+                assistant = message.get("message", {})
+                if assistant.get("model"):
+                    response.resolved_model = assistant["model"]
+                for block in assistant.get("content", []):
+                    if block.get("type") == "text" and block.get("text"):
+                        text = block["text"]
+                        chunks.append(text)
+                        if stream:
+                            yield text
+
+            elif message_type == "result":
+                usage_data = message.get("usage")
+                result_text = message.get("result")
+                result_structured_output = message.get("structured_output")
+                if message.get("is_error"):
+                    error_text = result_text or "Claude CLI returned an error"
+                    if message.get("errors"):
+                        error_text += ": " + "; ".join(
+                            str(error) for error in message["errors"]
+                        )
+                    raise RuntimeError(error_text)
+
+        final_text = "".join(chunks)
+        if not final_text and result_text:
+            final_text = result_text
+            chunks.append(result_text)
+            if stream:
+                yield result_text
+
+        if not stream and final_text:
+            yield final_text
+
+        self._set_usage_from_sdk(response, usage_data, prompt_text, final_text)
+        response.response_json = {
+            "model": self.claude_model_id,
+            "sdk": SDK_NAME,
+            "transport": "claude-cli",
+            "messages": response_messages,
+            "ignored_options": sorted(set(ignored_options)),
+            "prompt_mode": prompt_mode,
+            "structured_output": result_structured_output,
+        }
 
     async def _execute_async_impl(
         self,
@@ -905,7 +1179,11 @@ class _Shared:
 
         options = self._prompt_options(prompt)
         messages = self._build_messages(prompt, conversation)
-        sdk_options, ignored_options, schema_instruction = self._build_options(prompt)
+        stderr_lines: List[str] = []
+        sdk_options, ignored_options, schema_instruction = self._build_options(
+            prompt,
+            stderr_lines=stderr_lines,
+        )
         query_prompt, prompt_mode = self._build_query_prompt(messages, schema_instruction)
 
         response._prompt_json = {
@@ -913,11 +1191,24 @@ class _Shared:
             "messages": messages,
         }
 
+        if self._should_use_direct_cli(prompt, query_prompt):
+            async for chunk in self._execute_direct_cli_text(
+                prompt,
+                query_prompt,
+                stream,
+                response,
+                ignored_options,
+                prompt_mode,
+            ):
+                yield chunk
+            return
+
         chunks: List[str] = []
         response_messages: List[Dict[str, Any]] = []
         usage_data: Optional[dict] = None
         saw_text = False
         result_structured_output: Any = None
+        sdk_error: Optional[ResultMessage] = None
         prefill = self._prefill_text(prompt)
 
         if prefill:
@@ -925,56 +1216,63 @@ class _Shared:
             if stream:
                 yield prefill
 
-        async for message in query(prompt=query_prompt, options=sdk_options):
-            response_messages.append(self._serialize_message(message))
+        try:
+            async for message in query(prompt=query_prompt, options=sdk_options):
+                response_messages.append(self._serialize_message(message))
 
-            if isinstance(message, AssistantMessage):
-                if getattr(message, "model", None):
-                    response.resolved_model = message.model
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        saw_text = True
-                        chunks.append(block.text)
-                        if stream:
-                            yield block.text
-                    elif isinstance(block, ToolUseBlock):
-                        response.add_tool_call(
-                            llm.ToolCall(
-                                tool_call_id=block.id,
-                                name=block.name,
-                                arguments=block.input or {},
+                if isinstance(message, AssistantMessage):
+                    if getattr(message, "model", None):
+                        response.resolved_model = message.model
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            saw_text = True
+                            chunks.append(block.text)
+                            if stream:
+                                yield block.text
+                        elif isinstance(block, ToolUseBlock):
+                            response.add_tool_call(
+                                llm.ToolCall(
+                                    tool_call_id=block.id,
+                                    name=block.name,
+                                    arguments=block.input or {},
+                                )
                             )
-                        )
 
-            elif isinstance(message, StreamEvent):
-                partial_text = self._extract_stream_event_text(
-                    message,
-                    schema_expected=bool(prompt.schema),
-                )
-                if partial_text and options.include_partial_messages:
-                    saw_text = True
-                    chunks.append(partial_text)
-                    if stream:
-                        yield partial_text
+                elif isinstance(message, StreamEvent):
+                    partial_text = self._extract_stream_event_text(
+                        message,
+                        schema_expected=bool(prompt.schema),
+                    )
+                    if partial_text and options.include_partial_messages:
+                        saw_text = True
+                        chunks.append(partial_text)
+                        if stream:
+                            yield partial_text
 
-            elif isinstance(message, ResultMessage):
-                usage_data = message.usage
-                result_structured_output = getattr(message, "structured_output", None)
-                if message.is_error:
-                    raise RuntimeError(message.result or "Claude SDK returned an error")
+                elif isinstance(message, ResultMessage):
+                    usage_data = message.usage
+                    result_structured_output = getattr(message, "structured_output", None)
+                    if message.is_error:
+                        sdk_error = message
+                        continue
 
-                if result_structured_output is not None and prompt.schema and not saw_text:
-                    serialized = json.dumps(result_structured_output)
-                    saw_text = True
-                    chunks.append(serialized)
-                    if stream:
-                        yield serialized
+                    if result_structured_output is not None and prompt.schema and not saw_text:
+                        serialized = json.dumps(result_structured_output)
+                        saw_text = True
+                        chunks.append(serialized)
+                        if stream:
+                            yield serialized
 
-                if message.result and not saw_text:
-                    saw_text = True
-                    chunks.append(message.result)
-                    if stream:
-                        yield message.result
+                    if message.result and not saw_text:
+                        saw_text = True
+                        chunks.append(message.result)
+                        if stream:
+                            yield message.result
+        except Exception as ex:
+            stderr = self._format_stderr(stderr_lines)
+            if stderr:
+                raise RuntimeError(f"{ex}\nClaude stderr:\n{stderr}") from ex
+            raise
 
         final_text = "".join(chunks)
         if not stream and final_text:
@@ -989,6 +1287,9 @@ class _Shared:
             "prompt_mode": prompt_mode,
             "structured_output": result_structured_output,
         }
+
+        if sdk_error is not None:
+            raise RuntimeError(self._format_sdk_error(sdk_error))
 
 
 class ClaudeCodeMessages(_Shared, llm.Model):

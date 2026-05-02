@@ -39,8 +39,9 @@ def make_result(
     usage=None,
     is_error=False,
     structured_output=None,
+    errors=None,
 ):
-    return plugin.ResultMessage(
+    message = plugin.ResultMessage(
         subtype="success",
         duration_ms=1,
         duration_api_ms=1,
@@ -52,6 +53,9 @@ def make_result(
         result=result,
         structured_output=structured_output,
     )
+    if errors is not None:
+        message.errors = errors
+    return message
 
 
 def test_sync_response_collects_usage(monkeypatch):
@@ -100,6 +104,52 @@ def test_result_fallback_if_no_assistant_text(monkeypatch):
     response = model.prompt("Give final answer", stream=False)
 
     assert response.text() == "final only"
+
+
+def test_sdk_error_result_is_raised_after_metadata_is_recorded(monkeypatch):
+    async def fake_query(*, prompt, options):
+        yield make_result(result="provider rejected request", is_error=True)
+
+    monkeypatch.setattr(plugin, "query", fake_query)
+
+    model = make_model()
+    response = model.prompt("Fail", stream=False)
+
+    with pytest.raises(RuntimeError, match="provider rejected request"):
+        response.text()
+
+    assert response.response_json["messages"][0]["is_error"] is True
+    assert response.response_json["messages"][0]["result"] == "provider rejected request"
+
+
+def test_sdk_error_list_is_raised_when_result_is_empty(monkeypatch):
+    async def fake_query(*, prompt, options):
+        yield make_result(result=None, is_error=True, errors=["rate limit exceeded"])
+
+    monkeypatch.setattr(plugin, "query", fake_query)
+
+    model = make_model()
+    response = model.prompt("Fail", stream=False)
+
+    with pytest.raises(RuntimeError, match="rate limit exceeded"):
+        response.text()
+
+    assert response.response_json["messages"][0]["errors"] == ["rate limit exceeded"]
+
+
+def test_transport_exception_includes_sdk_stderr(monkeypatch):
+    async def fake_query(*, prompt, options):
+        options.stderr("provider stderr detail")
+        raise RuntimeError("transport failed")
+        yield
+
+    monkeypatch.setattr(plugin, "query", fake_query)
+
+    model = make_model()
+    response = model.prompt("Fail", stream=False)
+
+    with pytest.raises(RuntimeError, match="provider stderr detail"):
+        response.text()
 
 
 def test_partial_stream_events(monkeypatch):
@@ -249,6 +299,27 @@ def test_stream_json_mode_with_single_user_prompt(monkeypatch):
     assert first_content[0]["type"] == "image"
 
 
+def test_text_only_prompt_uses_string_mode(monkeypatch):
+    captured = {"prompt": None}
+
+    async def fake_query(*, prompt, options):
+        captured["prompt"] = prompt
+        yield plugin.AssistantMessage(
+            content=[plugin.TextBlock(text="OK")],
+            model="claude-sonnet-4",
+        )
+        yield make_result(result="OK")
+
+    monkeypatch.setattr(plugin, "query", fake_query)
+
+    model = make_model()
+    response = model.prompt("Plain text", stream=False)
+
+    assert response.text() == "OK"
+    assert captured["prompt"] == "Plain text"
+    assert response.response_json["prompt_mode"] == "text"
+
+
 def test_fallback_prompt_mode_for_conversation_history(monkeypatch):
     captured_modes = []
 
@@ -271,7 +342,8 @@ def test_fallback_prompt_mode_for_conversation_history(monkeypatch):
     assert response1.text() == "answer"
     response2 = conversation.prompt("second", stream=False)
     assert response2.text() == "answer"
-    assert captured_modes == ["stream", "string"]
+    assert captured_modes == ["string", "string"]
+    assert response1.response_json["prompt_mode"] == "text"
     assert response2.response_json["prompt_mode"] == "fallback_text"
 
 
