@@ -1,3 +1,5 @@
+import json
+
 import llm
 import pytest
 from pydantic import BaseModel
@@ -318,6 +320,23 @@ def test_text_only_prompt_uses_string_mode(monkeypatch):
     assert response.text() == "OK"
     assert captured["prompt"] == "Plain text"
     assert response.response_json["prompt_mode"] == "text"
+
+
+def test_direct_cli_command_passes_json_schema(monkeypatch):
+    monkeypatch.setattr(plugin._Shared, "_find_claude_cli", lambda self: "claude")
+
+    model = make_model("claude-code-opus-4-6")
+    response = model.prompt("Long prompt", schema=Dog, stream=False)
+    command, _ = model._direct_cli_command(response.prompt)
+
+    schema_index = command.index("--json-schema")
+    schema = command[schema_index + 1]
+
+    assert json.loads(schema)["properties"]["name"]["type"] == "string"
+    assert model._should_use_direct_cli(
+        response.prompt,
+        "x" * plugin.DIRECT_CLI_TEXT_THRESHOLD,
+    )
 
 
 def test_fallback_prompt_mode_for_conversation_history(monkeypatch):

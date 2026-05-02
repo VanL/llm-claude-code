@@ -999,7 +999,7 @@ class _Shared:
             return False
         if len(query_prompt) < DIRECT_CLI_TEXT_THRESHOLD:
             return False
-        if prompt.schema or prompt.tools or prompt.tool_results or prompt.attachments:
+        if prompt.tools or prompt.tool_results or prompt.attachments:
             return False
 
         options = self._prompt_options(prompt)
@@ -1050,6 +1050,10 @@ class _Shared:
 
         if options.settings:
             cmd.extend(["--settings", options.settings])
+
+        schema_dict = _schema_to_dict(prompt.schema)
+        if schema_dict:
+            cmd.extend(["--json-schema", json.dumps(schema_dict)])
 
         if options.thinking is False:
             cmd.extend(["--thinking", "disabled"])
